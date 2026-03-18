@@ -2,13 +2,18 @@
 
 ## Ringkasan Fitur
 - Baca RFID ID-12LA via UART2.
-- Subscribe MQTT topic `boseh/status`.
+- Subscribe MQTT topic:
+  - `boseh/status` (validasi slot untuk `bike_id`)
+  - `boseh/device/<slot>/control` (kontrol solenoid/LED)
+  - `boseh/<slot>` (request publish maintenance)
 - Publish MQTT:
   - `boseh/ready`
   - `boseh/stasiun/confirm_open`
+  - `boseh/maintenance`
 - Dashboard web untuk update konfigurasi tanpa edit kode.
 - OTA firmware upload dari browser.
 - Penyimpanan konfigurasi persisten dengan `Preferences` (NVS).
+ - Mode AP: hanya melayani dashboard konfigurasi (fungsi lain dihentikan sementara).
 
 ## Konfigurasi Yang Bisa Diubah Dari Dashboard
 - `WiFi SSID`
@@ -19,8 +24,8 @@
 Semua konfigurasi tersimpan permanen dan dipakai saat reboot berikutnya.
 
 ## Nilai Default Konfigurasi
-- `WiFi SSID`: `TUBIS43LT2`
-- `WiFi Password`: `12345678`
+- `WiFi SSID`: `Bapa`
+- `WiFi Password`: `12345678901`
 - `MQTT Broker IP`: `192.168.0.105`
 - `MQTT Port`: `1883`
 - `Slot Number`: `1`
@@ -48,6 +53,23 @@ Jika WiFi gagal terkoneksi, ESP32 otomatis masuk AP fallback:
 ```json
 {"slot_number": 8, "rfid_tag": "00000008"}
 ```
+Dipakai untuk mengisi `bike_id` agar bisa dikirim ke `boseh/ready`.
+
+### Subscribe Kontrol Solenoid
+- Topic: `boseh/device/<slot>/control`
+- Contoh payload:
+```json
+{"slot_number": 2, "command": "solenoid", "value": true}
+```
+Jika `slot_number` cocok, maka LED aksi (`GPIO2`) diubah ON/OFF.
+
+### Subscribe Request Maintenance
+- Topic: `boseh/<slot>`
+- Contoh payload:
+```json
+{"status": true}
+```
+Jika `status` bernilai `true`, perangkat akan publish status maintenance.
 
 ### Publish `boseh/ready`
 - Trigger: tombol ditekan dalam window validasi slot 60 detik.
@@ -65,6 +87,17 @@ Jika WiFi gagal terkoneksi, ESP32 otomatis masuk AP fallback:
 {"slot_number": 8, "rfid_tag": "00000008", "status": true}
 ```
 `slot_number` diambil dari konfigurasi `Slot Number` di dashboard.
+`rfid_tag` diambil dari hasil baca kartu RFID serial.
+
+### Publish `boseh/maintenance`
+- Trigger: menerima request `{"status": true}` dari topic `boseh/<slot>`.
+- Payload:
+```json
+{"slot_number":2,"ip_address":"10.58.115.187","status":true,"solenoid":false,"rfid_tag":"3D00F6A2EF86"}
+```
+`status` bernilai `true` hanya jika MQTT benar-benar terkoneksi.
+`solenoid` merepresentasikan LED aksi (`GPIO2`).
+`rfid_tag` diambil dari hasil baca kartu RFID serial terakhir.
 
 ## Mapping Pin
 - `GPIO16`: RX dari ID-12LA (D0)

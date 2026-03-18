@@ -15,8 +15,8 @@
 #define LED_BUTTON  15     // GPIO15 -> LED tombol (aktif LOW)
 #define LED_ACTION  2      // GPIO2  -> LED aksi 10 detik
 
-const char* WIFI_SSID_DEFAULT = "TUBIS43LT2";
-const char* WIFI_PASSWORD_DEFAULT = "12345678";
+const char* WIFI_SSID_DEFAULT = "Bapa";
+const char* WIFI_PASSWORD_DEFAULT = "12345678901";
 const char* MQTT_SERVER_DEFAULT = "192.168.0.105";
 const int   MQTT_PORT = 1883;
 const int   SLOT_NUMBER_DEFAULT = 1;
@@ -24,13 +24,16 @@ const int   SLOT_NUMBER_DEFAULT = 1;
 const char* MQTT_STATUS_TOPIC = "boseh/status";
 const char* MQTT_READY_TOPIC = "boseh/ready";
 const char* MQTT_CONFIRM_TOPIC = "boseh/stasiun/confirm_open";
+const char* MQTT_MAINT_TOPIC = "boseh/maintenance";
 
 String wifiSsidConfig = WIFI_SSID_DEFAULT;
 String wifiPasswordConfig = WIFI_PASSWORD_DEFAULT;
 String mqttServerConfig = MQTT_SERVER_DEFAULT;
 int slotNumberConfig = SLOT_NUMBER_DEFAULT;
+String mqttControlTopic = "";
+String mqttStatusRequestTopic = "";
 
-const char* AP_FALLBACK_SSID = "ESP32-Config";
+const char* AP_FALLBACK_SSID = "BOSEH-Config";
 const char* AP_FALLBACK_PASSWORD = "12345678";
 
 WiFiClient espClient;
@@ -50,6 +53,8 @@ unsigned long buttonWaitStartMs = 0;
 unsigned long actionStartMs = 0;
 String currentBikeId = "";
 String lastStatusRfidTag = "";
+String lastCardRfidTag = "";
+bool solenoidState = false;
 
 bool apModeActive = false;
 
@@ -91,6 +96,41 @@ String parseJsonString(const String& msg, const char* key) {
   return msg.substring(idx, end);
 }
 
+bool parseJsonBool(const String& msg, const char* key, bool* outValue) {
+  if (!outValue) return false;
+
+  String pattern = "\"";
+  pattern += key;
+  pattern += "\"";
+
+  int idx = msg.indexOf(pattern);
+  if (idx < 0) return false;
+
+  idx = msg.indexOf(':', idx);
+  if (idx < 0) return false;
+
+  idx++;
+  while (idx < (int)msg.length() && msg[idx] == ' ') idx++;
+
+  if (msg.startsWith("true", idx)) {
+    *outValue = true;
+    return true;
+  }
+  if (msg.startsWith("false", idx)) {
+    *outValue = false;
+    return true;
+  }
+  return false;
+}
+
+void updateMqttControlTopic() {
+  mqttControlTopic = "boseh/device/";
+  mqttControlTopic += String(slotNumberConfig);
+  mqttControlTopic += "/control";
+  mqttStatusRequestTopic = "boseh/";
+  mqttStatusRequestTopic += String(slotNumberConfig);
+}
+
 void loadConfig() {
   prefs.begin("cfg", true);
   wifiSsidConfig = prefs.getString("wifi_ssid", WIFI_SSID_DEFAULT);
@@ -100,6 +140,7 @@ void loadConfig() {
   prefs.end();
 
   if (slotNumberConfig <= 0) slotNumberConfig = SLOT_NUMBER_DEFAULT;
+  updateMqttControlTopic();
 }
 
 void saveConfig(const String& ssid, const String& pass, const String& mqttIp, int slotNo) {
@@ -164,6 +205,16 @@ void connectMQTT() {
       mqttClient.subscribe(MQTT_STATUS_TOPIC);
       Serial.print("Subscribed to: ");
       Serial.println(MQTT_STATUS_TOPIC);
+      if (mqttControlTopic.length() > 0) {
+        mqttClient.subscribe(mqttControlTopic.c_str());
+        Serial.print("Subscribed to: ");
+        Serial.println(mqttControlTopic);
+      }
+      if (mqttStatusRequestTopic.length() > 0) {
+        mqttClient.subscribe(mqttStatusRequestTopic.c_str());
+        Serial.print("Subscribed to: ");
+        Serial.println(mqttStatusRequestTopic);
+      }
     } else {
       Serial.print(".");
       delay(500);
@@ -232,6 +283,41 @@ void publishConfirmOpen(const String& rfidTag, bool status) {
   }
 }
 
+void publishMaintenanceStatus() {
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (!mqttClient.connected()) connectMQTT();
+  mqttClient.loop();
+
+  if (!mqttClient.connected()) {
+    Serial.println("MQTT tidak terkoneksi, publish maintenance gagal");
+    return;
+  }
+
+  String payload;
+  payload.reserve(128);
+  payload += "{\"slot_number\":";
+  payload += String(slotNumberConfig);
+  payload += ",\"ip_address\":\"";
+  payload += WiFi.localIP().toString();
+  payload += "\",\"status\":";
+  payload += (mqttClient.connected() ? "true" : "false");
+  payload += ",\"solenoid\":";
+  payload += (solenoidState ? "true" : "false");
+  payload += ",\"rfid_tag\":\"";
+  payload += lastCardRfidTag;
+  payload += "\"";
+  payload += "}";
+
+  bool ok = mqttClient.publish(MQTT_MAINT_TOPIC, payload.c_str());
+  Serial.print("Publish ");
+  Serial.print(MQTT_MAINT_TOPIC);
+  Serial.print(": ");
+  Serial.println(payload);
+  if (!ok) {
+    Serial.println("Publish maintenance gagal");
+  }
+}
+
 String htmlPage() {
   String html;
   html.reserve(3500);
@@ -285,6 +371,7 @@ void handleSaveConfig() {
   mqttServerConfig = mqtt;
   slotNumberConfig = slot;
   saveConfig(wifiSsidConfig, wifiPasswordConfig, mqttServerConfig, slotNumberConfig);
+  updateMqttControlTopic();
 
   mqttClient.disconnect();
   WiFi.disconnect(true);
@@ -336,45 +423,89 @@ void setupWebServer() {
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  if (strcmp(topic, MQTT_STATUS_TOPIC) != 0) return;
-
   String message;
   message.reserve(length);
   for (unsigned int i = 0; i < length; i++) {
     message += (char)payload[i];
   }
 
-  Serial.print("Status update [");
+  Serial.print("MQTT masuk [");
   Serial.print(topic);
   Serial.print("]: ");
   Serial.println(message);
 
-  int slot = parseSlotNumber(message);
-  String rfidTag = parseJsonString(message, "rfid_tag");
-  if (slot < 0) {
-    Serial.println("slot_number tidak ditemukan");
-    buttonWaitActive = false;
-    currentBikeId = "";
-    lastStatusRfidTag = "";
+  if (strcmp(topic, MQTT_STATUS_TOPIC) == 0) {
+    int slot = parseSlotNumber(message);
+    String rfidTag = parseJsonString(message, "rfid_tag");
+    if (slot < 0) {
+      Serial.println("slot_number tidak ditemukan");
+      buttonWaitActive = false;
+      currentBikeId = "";
+      lastStatusRfidTag = "";
+      return;
+    }
+
+    if (slot == slotNumberConfig) {
+      currentBikeId = rfidTag;
+      lastStatusRfidTag = rfidTag;
+      buttonWaitActive = true;
+      buttonWaitStartMs = millis();
+      Serial.print("slot_number cocok: ");
+      Serial.println(slot);
+      Serial.print("rfid_tag: ");
+      Serial.println(currentBikeId);
+      Serial.println("Menunggu tombol selama 60 detik");
+    } else {
+      buttonWaitActive = false;
+      currentBikeId = "";
+      lastStatusRfidTag = "";
+      Serial.print("slot number tidak sama: ");
+      Serial.println(slot);
+    }
     return;
   }
 
-  if (slot == slotNumberConfig) {
-    currentBikeId = rfidTag;
-    lastStatusRfidTag = rfidTag;
-    buttonWaitActive = true;
-    buttonWaitStartMs = millis();
-    Serial.print("slot_number cocok: ");
-    Serial.println(slot);
-    Serial.print("rfid_tag: ");
-    Serial.println(currentBikeId);
-    Serial.println("Menunggu tombol selama 60 detik");
-  } else {
-    buttonWaitActive = false;
-    currentBikeId = "";
-    lastStatusRfidTag = "";
-    Serial.print("slot number tidak sama: ");
-    Serial.println(slot);
+  if (mqttControlTopic.length() > 0 && strcmp(topic, mqttControlTopic.c_str()) == 0) {
+    int slot = parseSlotNumber(message);
+    String command = parseJsonString(message, "command");
+    bool value = false;
+    bool hasValue = parseJsonBool(message, "value", &value);
+
+    if (slot != slotNumberConfig) {
+      Serial.println("slot_number tidak cocok, kontrol diabaikan");
+      return;
+    }
+    if (command != "solenoid" || !hasValue) {
+      Serial.println("command/value tidak valid");
+      return;
+    }
+
+    solenoidState = value;
+    digitalWrite(LED_ACTION, solenoidState ? HIGH : LOW);
+    if (solenoidState) {
+      actionActive = true;
+      actionStartMs = millis();
+    } else {
+      actionActive = false;
+    }
+    Serial.print("Solenoid set ke: ");
+    Serial.println(solenoidState ? "ON" : "OFF");
+    return;
+  }
+
+  if (mqttStatusRequestTopic.length() > 0 && strcmp(topic, mqttStatusRequestTopic.c_str()) == 0) {
+    bool status = false;
+    bool hasStatus = parseJsonBool(message, "status", &status);
+    if (!hasStatus) {
+      Serial.println("status tidak ditemukan, abaikan");
+      return;
+    }
+    if (status) {
+      publishMaintenanceStatus();
+    } else {
+      Serial.println("status=false, maintenance tidak dikirim");
+    }
+    return;
   }
 }
 
@@ -406,6 +537,11 @@ void setup() {
 void loop() {
   server.handleClient();
 
+  if (apModeActive) {
+    delay(10);
+    return;
+  }
+
   if (WiFi.status() != WL_CONNECTED && !apModeActive) connectWiFi();
   if (!mqttClient.connected()) connectMQTT();
   mqttClient.loop();
@@ -415,7 +551,11 @@ void loop() {
   if (inRange && !tagDetected) {
     tagDetected = true;
     Serial.println("TAG MASUK RANGE!");
-    publishConfirmOpen(lastStatusRfidTag, true);
+    if (lastCardRfidTag.length() > 0) {
+      publishConfirmOpen(lastCardRfidTag, true);
+    } else {
+      Serial.println("rfid_tag kosong (belum ada kartu terbaca), confirm_open tidak dikirim");
+    }
   }
 
   if (RFIDSerial.available() > 0) {
@@ -437,6 +577,7 @@ void loop() {
       Serial.println(" ms");
       Serial.println("-----------------------------------");
       digitalWrite(LED_status, LOW);
+      lastCardRfidTag = tagID;
     }
   }
 
@@ -444,7 +585,11 @@ void loop() {
     tagDetected = false;
     Serial.println("Tag keluar range\n");
     digitalWrite(LED_status, HIGH);
-    publishConfirmOpen(lastStatusRfidTag, false);
+    if (lastCardRfidTag.length() > 0) {
+      publishConfirmOpen(lastCardRfidTag, false);
+    } else {
+      Serial.println("rfid_tag kosong (belum ada kartu terbaca), confirm_open tidak dikirim");
+    }
   }
 
   bool buttonPressed = (digitalRead(BUTTON_PIN) == LOW);
@@ -459,6 +604,7 @@ void loop() {
   if (actionActive && (millis() - actionStartMs >= 10000)) {
     actionActive = false;
     digitalWrite(LED_ACTION, LOW);
+    solenoidState = false;
     Serial.println("LED aksi OFF");
   }
 
@@ -471,6 +617,7 @@ void loop() {
     actionActive = true;
     actionStartMs = millis();
     digitalWrite(LED_ACTION, HIGH);
+    solenoidState = true;
     publishReadyMessage(currentBikeId);
     Serial.println("Tombol ditekan: LED aksi ON 10 detik");
     currentBikeId = "";
