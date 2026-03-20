@@ -33,7 +33,7 @@ int slotNumberConfig = SLOT_NUMBER_DEFAULT;
 String mqttControlTopic = "";
 String mqttStatusRequestTopic = "";
 
-const char* AP_FALLBACK_SSID = "BOSEH-Config";
+const char* AP_FALLBACK_SSID_BASE = "BOSEH-Config-";
 const char* AP_FALLBACK_PASSWORD = "12345678";
 
 WiFiClient espClient;
@@ -57,6 +57,12 @@ String lastCardRfidTag = "";
 bool solenoidState = false;
 
 bool apModeActive = false;
+
+int clampApOctet(int slotNo) {
+  if (slotNo < 2) return 2;
+  if (slotNo > 254) return 254;
+  return slotNo;
+}
 
 int parseSlotNumber(const String& msg) {
   int idx = msg.indexOf("\"slot_number\"");
@@ -156,11 +162,18 @@ void startFallbackAP() {
   if (apModeActive) return;
 
   WiFi.mode(WIFI_AP_STA);
-  bool ok = WiFi.softAP(AP_FALLBACK_SSID, AP_FALLBACK_PASSWORD);
+  int apOctet = clampApOctet(slotNumberConfig);
+  IPAddress apIP(192, 168, 4, apOctet);
+  IPAddress apGW(192, 168, 4, apOctet);
+  IPAddress apSN(255, 255, 255, 0);
+  WiFi.softAPConfig(apIP, apGW, apSN);
+
+  String apSsid = String(AP_FALLBACK_SSID_BASE) + String(slotNumberConfig);
+  bool ok = WiFi.softAP(apSsid.c_str(), AP_FALLBACK_PASSWORD);
   if (ok) {
     apModeActive = true;
     Serial.print("AP fallback aktif. SSID: ");
-    Serial.println(AP_FALLBACK_SSID);
+    Serial.println(apSsid);
     Serial.print("AP IP: ");
     Serial.println(WiFi.softAPIP());
   } else {
@@ -168,7 +181,15 @@ void startFallbackAP() {
   }
 }
 
-void connectWiFi() {
+void stopFallbackAPIfConnected() {
+  if (apModeActive && WiFi.status() == WL_CONNECTED) {
+    WiFi.softAPdisconnect(true);
+    apModeActive = false;
+    Serial.println("AP fallback dimatikan (STA sudah terkoneksi)");
+  }
+}
+
+void connectWiFi(bool allowApFallback) {
   if (WiFi.status() == WL_CONNECTED) return;
 
   WiFi.mode(WIFI_STA);
@@ -185,9 +206,13 @@ void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("WiFi connected, IP: ");
     Serial.println(WiFi.localIP());
+    stopFallbackAPIfConnected();
   } else {
-    Serial.println("WiFi connect failed, masuk AP fallback");
-    startFallbackAP();
+    Serial.println("WiFi connect failed");
+    if (allowApFallback) {
+      Serial.println("Masuk AP fallback");
+      startFallbackAP();
+    }
   }
 }
 
@@ -232,7 +257,7 @@ void publishReadyMessage(const String& bikeId) {
     return;
   }
 
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (WiFi.status() != WL_CONNECTED) connectWiFi(false);
   if (!mqttClient.connected()) connectMQTT();
   mqttClient.loop();
 
@@ -254,7 +279,7 @@ void publishReadyMessage(const String& bikeId) {
 }
 
 void publishConfirmOpen(const String& rfidTag, bool status) {
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (WiFi.status() != WL_CONNECTED) connectWiFi(false);
   if (!mqttClient.connected()) connectMQTT();
   mqttClient.loop();
 
@@ -284,7 +309,7 @@ void publishConfirmOpen(const String& rfidTag, bool status) {
 }
 
 void publishMaintenanceStatus() {
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (WiFi.status() != WL_CONNECTED) connectWiFi(false);
   if (!mqttClient.connected()) connectMQTT();
   mqttClient.loop();
 
@@ -322,13 +347,13 @@ String htmlPage() {
   String html;
   html.reserve(3500);
   html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>ESP32 Dashboard</title>";
+  html += "<title>IoT Boseh</title>";
   html += "<style>body{font-family:Arial,sans-serif;background:#f5f7fb;margin:0;padding:20px;}";
   html += ".card{max-width:700px;margin:auto;background:#fff;padding:20px;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.08);}h2{margin-top:0;}";
   html += "label{display:block;margin-top:12px;font-weight:600;}input{width:100%;padding:10px;margin-top:6px;border:1px solid #ccc;border-radius:8px;}";
   html += "button{margin-top:16px;padding:10px 16px;border:0;background:#0066cc;color:#fff;border-radius:8px;cursor:pointer;}";
   html += "small{color:#666;} .row{margin-top:12px;padding:10px;background:#f1f5f9;border-radius:8px;}</style></head><body>";
-  html += "<div class='card'><h2>ESP32 Config Dashboard</h2>";
+  html += "<div class='card'><h2>Boseh Device Config</h2>";
   html += "<div class='row'><b>WiFi STA IP:</b> ";
   html += WiFi.localIP().toString();
   html += "<br><b>AP IP:</b> ";
@@ -376,7 +401,7 @@ void handleSaveConfig() {
   mqttClient.disconnect();
   WiFi.disconnect(true);
   delay(300);
-  connectWiFi();
+  connectWiFi(true);
   connectMQTT();
 
   server.send(200, "text/html", "<html><body><h3>Config tersimpan.</h3><a href='/'>Kembali</a></body></html>");
@@ -524,7 +549,7 @@ void setup() {
   digitalWrite(LED_ACTION, LOW);
 
   loadConfig();
-  connectWiFi();
+  connectWiFi(true);
   setupWebServer();
 
   mqttClient.setCallback(mqttCallback);
@@ -542,7 +567,7 @@ void loop() {
     return;
   }
 
-  if (WiFi.status() != WL_CONNECTED && !apModeActive) connectWiFi();
+  if (WiFi.status() != WL_CONNECTED) connectWiFi(false);
   if (!mqttClient.connected()) connectMQTT();
   mqttClient.loop();
 

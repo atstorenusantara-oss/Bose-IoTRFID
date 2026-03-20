@@ -13,7 +13,8 @@
 - Dashboard web untuk update konfigurasi tanpa edit kode.
 - OTA firmware upload dari browser.
 - Penyimpanan konfigurasi persisten dengan `Preferences` (NVS).
- - Mode AP: hanya melayani dashboard konfigurasi (fungsi lain dihentikan sementara).
+- Mode AP fallback hanya aktif jika konek WiFi awal (saat boot) gagal >15 detik.
+- Saat AP fallback aktif, perangkat hanya melayani dashboard konfigurasi (fungsi lain dihentikan sementara).
 
 ## Konfigurasi Yang Bisa Diubah Dari Dashboard
 - `WiFi SSID`
@@ -35,10 +36,14 @@ Semua konfigurasi tersimpan permanen dan dipakai saat reboot berikutnya.
 2. Buka browser ke `http://<IP-ESP32>/`.
 3. Ubah konfigurasi lalu klik `Simpan Config`.
 
-Jika WiFi gagal terkoneksi, ESP32 otomatis masuk AP fallback:
-- SSID: `ESP32-Config`
+Jika WiFi gagal terkoneksi saat boot, ESP32 otomatis masuk AP fallback:
+- SSID: `BOSEH-Config-<slot_number>`
 - Password: `12345678`
-- IP AP: `192.168.4.1`
+- IP AP: `192.168.4.<slot_number>` (dibatasi ke rentang 2..254 agar valid)
+
+Catatan:
+- Setelah konfigurasi disimpan dan WiFi berhasil tersambung, AP fallback akan dimatikan.
+- Di runtime, jika WiFi putus, perangkat hanya melakukan reconnect WiFi (tanpa mengaktifkan AP fallback lagi).
 
 ## OTA Firmware (Web)
 1. Buka dashboard `http://<IP-ESP32>/`.
