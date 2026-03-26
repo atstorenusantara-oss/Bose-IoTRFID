@@ -14,9 +14,10 @@
 #define BUTTON_PIN  23     // GPIO23 -> Tombol input
 #define LED_BUTTON  15     // GPIO15 -> LED tombol (aktif LOW)
 #define LED_ACTION  2      // GPIO2  -> LED aksi 10 detik
+#define LED_ACTION_INV 22  // GPIO22 -> LED aksi mirror (aktif LOW)
 
-const char* WIFI_SSID_DEFAULT = "Bapa";
-const char* WIFI_PASSWORD_DEFAULT = "12345678901";
+const char* WIFI_SSID_DEFAULT = "TUBIS43LT2";
+const char* WIFI_PASSWORD_DEFAULT = "12345678";
 const char* MQTT_SERVER_DEFAULT = "192.168.0.105";
 const int   MQTT_PORT = 1883;
 const int   SLOT_NUMBER_DEFAULT = 1;
@@ -57,6 +58,11 @@ String lastCardRfidTag = "";
 bool solenoidState = false;
 
 bool apModeActive = false;
+
+void setActionLeds(bool active) {
+  digitalWrite(LED_ACTION, active ? HIGH : LOW);
+  digitalWrite(LED_ACTION_INV, active ? LOW : HIGH);
+}
 
 int clampApOctet(int slotNo) {
   if (slotNo < 2) return 2;
@@ -506,7 +512,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
 
     solenoidState = value;
-    digitalWrite(LED_ACTION, solenoidState ? HIGH : LOW);
+    setActionLeds(solenoidState);
     if (solenoidState) {
       actionActive = true;
       actionStartMs = millis();
@@ -543,10 +549,11 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(LED_BUTTON, OUTPUT);
   pinMode(LED_ACTION, OUTPUT);
+  pinMode(LED_ACTION_INV, OUTPUT);
 
   digitalWrite(LED_status, HIGH);
   digitalWrite(LED_BUTTON, HIGH);
-  digitalWrite(LED_ACTION, LOW);
+  setActionLeds(false);
 
   loadConfig();
   connectWiFi(true);
@@ -628,7 +635,7 @@ void loop() {
 
   if (actionActive && (millis() - actionStartMs >= 10000)) {
     actionActive = false;
-    digitalWrite(LED_ACTION, LOW);
+    setActionLeds(false);
     solenoidState = false;
     Serial.println("LED aksi OFF");
   }
@@ -641,7 +648,7 @@ void loop() {
     buttonWaitActive = false;
     actionActive = true;
     actionStartMs = millis();
-    digitalWrite(LED_ACTION, HIGH);
+    setActionLeds(true);
     solenoidState = true;
     publishReadyMessage(currentBikeId);
     Serial.println("Tombol ditekan: LED aksi ON 10 detik");
@@ -651,3 +658,5 @@ void loop() {
   lastButtonState = buttonPressed;
   delay(50);
 }
+
+
