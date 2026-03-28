@@ -14,7 +14,7 @@
 #define BUTTON_PIN  23     // GPIO23 -> Tombol input
 #define LED_BUTTON  15     // GPIO15 -> LED tombol (aktif LOW)
 #define LED_ACTION  2      // GPIO2  -> LED aksi 10 detik
-#define LED_ACTION_INV 22  // GPIO22 -> LED aksi mirror (aktif LOW)
+#define LED_ACTION_INV 22  // GPIO22 -> LED indikator status (aktif LOW)
 
 const char* WIFI_SSID_DEFAULT = "TUBIS43LT2";
 const char* WIFI_PASSWORD_DEFAULT = "12345678";
@@ -59,8 +59,11 @@ bool solenoidState = false;
 
 bool apModeActive = false;
 
-void setActionLeds(bool active) {
+void setActionLed(bool active) {
   digitalWrite(LED_ACTION, active ? HIGH : LOW);
+}
+
+void setMirrorLed(bool active) {
   digitalWrite(LED_ACTION_INV, active ? LOW : HIGH);
 }
 
@@ -470,6 +473,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     String rfidTag = parseJsonString(message, "rfid_tag");
     if (slot < 0) {
       Serial.println("slot_number tidak ditemukan");
+      if (buttonWaitActive && !actionActive) {
+        setMirrorLed(false);
+        solenoidState = false;
+      }
       buttonWaitActive = false;
       currentBikeId = "";
       lastStatusRfidTag = "";
@@ -480,13 +487,19 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       currentBikeId = rfidTag;
       lastStatusRfidTag = rfidTag;
       buttonWaitActive = true;
-      buttonWaitStartMs = millis();
+      // Pin 22 jadi indikator status: nyala saat slot cocok.
+      setMirrorLed(true);
+      solenoidState = true;
       Serial.print("slot_number cocok: ");
       Serial.println(slot);
       Serial.print("rfid_tag: ");
       Serial.println(currentBikeId);
-      Serial.println("Menunggu tombol selama 60 detik");
+      Serial.println("Status cocok: LED indikator pin22 ON, menunggu tombol");
     } else {
+      if (buttonWaitActive && !actionActive) {
+        setMirrorLed(false);
+        solenoidState = false;
+      }
       buttonWaitActive = false;
       currentBikeId = "";
       lastStatusRfidTag = "";
@@ -512,7 +525,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
 
     solenoidState = value;
-    setActionLeds(solenoidState);
+    setActionLed(solenoidState);
+    setMirrorLed(solenoidState);
     if (solenoidState) {
       actionActive = true;
       actionStartMs = millis();
@@ -553,7 +567,8 @@ void setup() {
 
   digitalWrite(LED_status, HIGH);
   digitalWrite(LED_BUTTON, HIGH);
-  setActionLeds(false);
+  setActionLed(false);
+  setMirrorLed(false);
 
   loadConfig();
   connectWiFi(true);
@@ -627,15 +642,11 @@ void loop() {
   bool buttonPressed = (digitalRead(BUTTON_PIN) == LOW);
   digitalWrite(LED_BUTTON, buttonPressed ? LOW : HIGH);
 
-  if (buttonWaitActive && (millis() - buttonWaitStartMs >= 60000)) {
-    buttonWaitActive = false;
-    currentBikeId = "";
-    Serial.println("Timeout tombol 60 detik");
-  }
 
   if (actionActive && (millis() - actionStartMs >= 10000)) {
     actionActive = false;
-    setActionLeds(false);
+    setActionLed(false);
+    setMirrorLed(false);
     solenoidState = false;
     Serial.println("LED aksi OFF");
   }
@@ -648,7 +659,8 @@ void loop() {
     buttonWaitActive = false;
     actionActive = true;
     actionStartMs = millis();
-    setActionLeds(true);
+    setActionLed(true);
+    setMirrorLed(true);
     solenoidState = true;
     publishReadyMessage(currentBikeId);
     Serial.println("Tombol ditekan: LED aksi ON 10 detik");
