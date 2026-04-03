@@ -18,7 +18,7 @@
 
 const char* WIFI_SSID_DEFAULT = "TUBIS43LT2";
 const char* WIFI_PASSWORD_DEFAULT = "12345678";
-const char* MQTT_SERVER_DEFAULT = "192.168.0.105";
+const char* MQTT_SERVER_DEFAULT = "192.168.0.177";
 const int   MQTT_PORT = 1883;
 const int   SLOT_NUMBER_DEFAULT = 1;
 
@@ -58,13 +58,19 @@ String lastCardRfidTag = "";
 bool solenoidState = false;
 
 bool apModeActive = false;
+bool relayPin2ActiveHigh = true;
+bool relayPin22ActiveHigh = false;
+
+void writeOutputActiveLevel(uint8_t pin, bool active, bool activeHigh) {
+  digitalWrite(pin, active ? (activeHigh ? HIGH : LOW) : (activeHigh ? LOW : HIGH));
+}
 
 void setActionLed(bool active) {
-  digitalWrite(LED_ACTION, active ? HIGH : LOW);
+  writeOutputActiveLevel(LED_ACTION, active, relayPin2ActiveHigh);
 }
 
 void setMirrorLed(bool active) {
-  digitalWrite(LED_ACTION_INV, active ? LOW : HIGH);
+  writeOutputActiveLevel(LED_ACTION_INV, active, relayPin22ActiveHigh);
 }
 
 int clampApOctet(int slotNo) {
@@ -138,6 +144,73 @@ bool parseJsonBool(const String& msg, const char* key, bool* outValue) {
   return false;
 }
 
+
+
+bool isHexChar(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F');
+}
+
+bool hexPairToByte(char hi, char lo, uint8_t* out) {
+  if (!out) return false;
+
+  uint8_t high = 0;
+  uint8_t low = 0;
+
+  if (hi >= '0' && hi <= '9') high = (uint8_t)(hi - '0');
+  else if (hi >= 'A' && hi <= 'F') high = (uint8_t)(10 + hi - 'A');
+  else return false;
+
+  if (lo >= '0' && lo <= '9') low = (uint8_t)(lo - '0');
+  else if (lo >= 'A' && lo <= 'F') low = (uint8_t)(10 + lo - 'A');
+  else return false;
+
+  *out = (uint8_t)((high << 4) | low);
+  return true;
+}
+
+bool validateTagWithChecksum(const String& tenHexTag, const String& twoHexChecksum) {
+  if (tenHexTag.length() != 10 || twoHexChecksum.length() != 2) return false;
+
+  uint8_t xorValue = 0;
+  for (int i = 0; i < 10; i += 2) {
+    uint8_t tagByte = 0;
+    if (!hexPairToByte(tenHexTag[i], tenHexTag[i + 1], &tagByte)) return false;
+    xorValue ^= tagByte;
+  }
+
+  uint8_t expectedChecksum = 0;
+  if (!hexPairToByte(twoHexChecksum[0], twoHexChecksum[1], &expectedChecksum)) return false;
+  return xorValue == expectedChecksum;
+}
+
+bool extractValidTagFromRawHex(const String& rawHex, String* outTag) {
+  if (!outTag) return false;
+  if (rawHex.length() < 12) return false;
+
+  // Format umum: 10 hex tag + 2 hex checksum.
+  for (int i = 0; i <= (int)rawHex.length() - 12; i++) {
+    String tagCandidate = rawHex.substring(i, i + 10);
+    String checksumCandidate = rawHex.substring(i + 10, i + 12);
+    if (validateTagWithChecksum(tagCandidate, checksumCandidate)) {
+      *outTag = tagCandidate + checksumCandidate;
+      return true;
+    }
+  }
+
+  // Fallback jika urutan terbaca bergeser: 2 checksum + 10 tag.
+  // Tetap keluarkan dalam format kanonik 10 tag + 2 checksum.
+  for (int i = 0; i <= (int)rawHex.length() - 12; i++) {
+    String checksumCandidate = rawHex.substring(i, i + 2);
+    String tagCandidate = rawHex.substring(i + 2, i + 12);
+    if (validateTagWithChecksum(tagCandidate, checksumCandidate)) {
+      *outTag = tagCandidate + checksumCandidate;
+      return true;
+    }
+  }
+
+  return false;
+}
+
 void updateMqttControlTopic() {
   mqttControlTopic = "boseh/device/";
   mqttControlTopic += String(slotNumberConfig);
@@ -152,18 +225,22 @@ void loadConfig() {
   wifiPasswordConfig = prefs.getString("wifi_pass", WIFI_PASSWORD_DEFAULT);
   mqttServerConfig = prefs.getString("mqtt_ip", MQTT_SERVER_DEFAULT);
   slotNumberConfig = prefs.getInt("slot_no", SLOT_NUMBER_DEFAULT);
+  relayPin2ActiveHigh = prefs.getBool("r2_act_hi", true);
+  relayPin22ActiveHigh = prefs.getBool("r22_act_hi", false);
   prefs.end();
 
   if (slotNumberConfig <= 0) slotNumberConfig = SLOT_NUMBER_DEFAULT;
   updateMqttControlTopic();
 }
 
-void saveConfig(const String& ssid, const String& pass, const String& mqttIp, int slotNo) {
+void saveConfig(const String& ssid, const String& pass, const String& mqttIp, int slotNo, bool pin2ActiveHigh, bool pin22ActiveHigh) {
   prefs.begin("cfg", false);
   prefs.putString("wifi_ssid", ssid);
   prefs.putString("wifi_pass", pass);
   prefs.putString("mqtt_ip", mqttIp);
   prefs.putInt("slot_no", slotNo);
+  prefs.putBool("r2_act_hi", pin2ActiveHigh);
+  prefs.putBool("r22_act_hi", pin22ActiveHigh);
   prefs.end();
 }
 
@@ -359,7 +436,7 @@ String htmlPage() {
   html += "<title>IoT Boseh</title>";
   html += "<style>body{font-family:Arial,sans-serif;background:#f5f7fb;margin:0;padding:20px;}";
   html += ".card{max-width:700px;margin:auto;background:#fff;padding:20px;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.08);}h2{margin-top:0;}";
-  html += "label{display:block;margin-top:12px;font-weight:600;}input{width:100%;padding:10px;margin-top:6px;border:1px solid #ccc;border-radius:8px;}";
+  html += "label{display:block;margin-top:12px;font-weight:600;}input,select{width:100%;padding:10px;margin-top:6px;border:1px solid #ccc;border-radius:8px;background:#fff;}";
   html += "button{margin-top:16px;padding:10px 16px;border:0;background:#0066cc;color:#fff;border-radius:8px;cursor:pointer;}";
   html += "small{color:#666;} .row{margin-top:12px;padding:10px;background:#f1f5f9;border-radius:8px;}</style></head><body>";
   html += "<div class='card'><h2>Boseh Device Config</h2>";
@@ -375,6 +452,12 @@ String htmlPage() {
   html += "<label>WiFi Password</label><input name='password' type='password' value='" + wifiPasswordConfig + "'>";
   html += "<label>MQTT Broker IP</label><input name='mqtt' value='" + mqttServerConfig + "' required>";
   html += "<label>Slot Number</label><input name='slot' type='number' min='1' value='" + String(slotNumberConfig) + "' required>";
+  html += "<label>Relay Pin2 Active Level</label><select name='r2_active'>";
+  html += relayPin2ActiveHigh ? "<option value='high' selected>HIGH</option><option value='low'>LOW</option>" : "<option value='high'>HIGH</option><option value='low' selected>LOW</option>";
+  html += "</select>";
+  html += "<label>Relay Pin22 Active Level</label><select name='r22_active'>";
+  html += relayPin22ActiveHigh ? "<option value='high' selected>HIGH</option><option value='low'>LOW</option>" : "<option value='high'>HIGH</option><option value='low' selected>LOW</option>";
+  html += "</select>";
   html += "<button type='submit'>Simpan Config</button></form>";
   html += "<hr><h3>OTA Firmware Update</h3>";
   html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
@@ -394,6 +477,11 @@ void handleSaveConfig() {
   String pass = server.arg("password");
   String mqtt = server.arg("mqtt");
   int slot = server.arg("slot").toInt();
+  String relayPin2Arg = server.arg("r2_active");
+  String relayPin22Arg = server.arg("r22_active");
+
+  bool pin2ActiveHigh = !(relayPin2Arg == "low" || relayPin2Arg == "LOW" || relayPin2Arg == "0");
+  bool pin22ActiveHigh = !(relayPin22Arg == "low" || relayPin22Arg == "LOW" || relayPin22Arg == "0");
 
   if (ssid.length() == 0 || mqtt.length() == 0 || slot <= 0) {
     server.send(400, "text/plain", "Parameter tidak valid");
@@ -404,8 +492,12 @@ void handleSaveConfig() {
   wifiPasswordConfig = pass;
   mqttServerConfig = mqtt;
   slotNumberConfig = slot;
-  saveConfig(wifiSsidConfig, wifiPasswordConfig, mqttServerConfig, slotNumberConfig);
+  relayPin2ActiveHigh = pin2ActiveHigh;
+  relayPin22ActiveHigh = pin22ActiveHigh;
+  saveConfig(wifiSsidConfig, wifiPasswordConfig, mqttServerConfig, slotNumberConfig, relayPin2ActiveHigh, relayPin22ActiveHigh);
   updateMqttControlTopic();
+  setActionLed(solenoidState);
+  setMirrorLed(solenoidState);
 
   mqttClient.disconnect();
   WiFi.disconnect(true);
@@ -557,6 +649,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 void setup() {
   Serial.begin(115200);
   RFIDSerial.begin(9600, SERIAL_8N1, RX_PIN, -1);
+  loadConfig();
 
   pinMode(RANGE_PIN, INPUT);
   pinMode(LED_status, OUTPUT);
@@ -569,8 +662,6 @@ void setup() {
   digitalWrite(LED_BUTTON, HIGH);
   setActionLed(false);
   setMirrorLed(false);
-
-  loadConfig();
   connectWiFi(true);
   setupWebServer();
 
@@ -601,22 +692,36 @@ void loop() {
     if (lastCardRfidTag.length() > 0) {
       publishConfirmOpen(lastCardRfidTag, true);
     } else {
-      Serial.println("rfid_tag kosong (belum ada kartu terbaca), confirm_open tidak dikirim");
+      Serial.println("Menunggu RFID terbaca untuk kirim confirm_open status=true");
     }
   }
 
   if (RFIDSerial.available() > 0) {
-    tagID = "";
+    String rawHex = "";
+    bool frameEnded = false;
+    unsigned long readStartMs = millis();
 
-    while (RFIDSerial.available()) {
-      char c = RFIDSerial.read();
-      if (c == '\r' || c == '\n') break;
-      if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F')) {
-        tagID += c;
+    // Auto-refresh singkat: tunggu byte lanjutan agar frame tidak terpotong.
+    while ((millis() - readStartMs) < 30 && !frameEnded) {
+      while (RFIDSerial.available() > 0) {
+        char c = RFIDSerial.read();
+        if (c >= 'a' && c <= 'f') c = (char)(c - 32);
+
+        if (c == '\r' || c == '\n') {
+          frameEnded = true;
+          break;
+        }
+
+        if (isHexChar(c)) {
+          rawHex += c;
+        }
       }
+      if (!frameEnded) delay(1);
     }
 
-    if (tagID.length() >= 10) {
+    String validatedTag = "";
+    if (extractValidTagFromRawHex(rawHex, &validatedTag)) {
+      tagID = validatedTag;
       Serial.print("TAG TERBACA     : ");
       Serial.println(tagID);
       Serial.print("Scan Time       : ");
@@ -625,6 +730,12 @@ void loop() {
       Serial.println("-----------------------------------");
       digitalWrite(LED_status, LOW);
       lastCardRfidTag = tagID;
+      if (inRange) {
+        publishConfirmOpen(lastCardRfidTag, true);
+      }
+    } else if (rawHex.length() > 0) {
+      Serial.print("Frame RFID tidak valid/kurang lengkap, retry: ");
+      Serial.println(rawHex);
     }
   }
 
@@ -662,7 +773,15 @@ void loop() {
     setActionLed(true);
     setMirrorLed(true);
     solenoidState = true;
-    publishReadyMessage(currentBikeId);
+    String confirmTag = lastCardRfidTag;
+    if (confirmTag.length() == 0) {
+      confirmTag = currentBikeId;
+    }
+    if (confirmTag.length() > 0) {
+      publishConfirmOpen(confirmTag, false);
+    } else {
+      Serial.println("rfid_tag kosong, confirm_open tidak dikirim saat tombol ditekan");
+    }
     Serial.println("Tombol ditekan: LED aksi ON 10 detik");
     currentBikeId = "";
   }
