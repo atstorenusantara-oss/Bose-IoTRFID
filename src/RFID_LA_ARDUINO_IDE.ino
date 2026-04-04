@@ -10,10 +10,10 @@
 
 #define RX_PIN      16     // GPIO16 -> RFID Pin 9 (D0)
 #define RANGE_PIN   17     // GPIO17 -> RFID Pin 6 (Tag in Range)
-#define LED_status  4      // GPIO4 -> LED indikator (opsional)
+#define LED_status  2      // GPIO2 -> LED indikator (opsional) // untuk kalau ada RFID
 #define BUTTON_PIN  23     // GPIO23 -> Tombol input
 #define LED_BUTTON  15     // GPIO15 -> LED tombol (aktif LOW)
-#define LED_ACTION  2      // GPIO2  -> LED aksi 10 detik
+#define LED_ACTION  4      // GPIO4  -> LED aksi 10 detik (ini untuk output relay)
 #define LED_ACTION_INV 22  // GPIO22 -> LED indikator status (aktif LOW)
 
 const char* WIFI_SSID_DEFAULT = "TUBIS43LT2";
@@ -36,6 +36,7 @@ String mqttStatusRequestTopic = "";
 
 const char* AP_FALLBACK_SSID_BASE = "BOSEH-Config-";
 const char* AP_FALLBACK_PASSWORD = "12345678";
+const char* DASHBOARD_PIN = "1221";
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
@@ -46,6 +47,7 @@ HardwareSerial RFIDSerial(2);  // UART2 pada ESP32
 
 String tagID = "";
 bool tagDetected = false;
+bool dashboardUnlocked = false;
 
 bool buttonWaitActive = false;
 bool actionActive = false;
@@ -58,15 +60,23 @@ String lastCardRfidTag = "";
 bool solenoidState = false;
 
 bool apModeActive = false;
+bool relayPin4ActiveHigh = false;
 bool relayPin2ActiveHigh = true;
 bool relayPin22ActiveHigh = false;
+
+const uint8_t DEBUG_PINS[] = {LED_status, BUTTON_PIN, LED_BUTTON, LED_ACTION, LED_ACTION_INV};
+String debugMessage = "";
 
 void writeOutputActiveLevel(uint8_t pin, bool active, bool activeHigh) {
   digitalWrite(pin, active ? (activeHigh ? HIGH : LOW) : (activeHigh ? LOW : HIGH));
 }
 
 void setActionLed(bool active) {
-  writeOutputActiveLevel(LED_ACTION, active, relayPin2ActiveHigh);
+  writeOutputActiveLevel(LED_ACTION, active, relayPin4ActiveHigh);
+}
+
+void setStatusLed(bool active) {
+  writeOutputActiveLevel(LED_status, active, relayPin2ActiveHigh);
 }
 
 void setMirrorLed(bool active) {
@@ -225,6 +235,7 @@ void loadConfig() {
   wifiPasswordConfig = prefs.getString("wifi_pass", WIFI_PASSWORD_DEFAULT);
   mqttServerConfig = prefs.getString("mqtt_ip", MQTT_SERVER_DEFAULT);
   slotNumberConfig = prefs.getInt("slot_no", SLOT_NUMBER_DEFAULT);
+  relayPin4ActiveHigh = prefs.getBool("r4_act_hi", false);
   relayPin2ActiveHigh = prefs.getBool("r2_act_hi", true);
   relayPin22ActiveHigh = prefs.getBool("r22_act_hi", false);
   prefs.end();
@@ -233,12 +244,13 @@ void loadConfig() {
   updateMqttControlTopic();
 }
 
-void saveConfig(const String& ssid, const String& pass, const String& mqttIp, int slotNo, bool pin2ActiveHigh, bool pin22ActiveHigh) {
+void saveConfig(const String& ssid, const String& pass, const String& mqttIp, int slotNo, bool pin4ActiveHigh, bool pin2ActiveHigh, bool pin22ActiveHigh) {
   prefs.begin("cfg", false);
   prefs.putString("wifi_ssid", ssid);
   prefs.putString("wifi_pass", pass);
   prefs.putString("mqtt_ip", mqttIp);
   prefs.putInt("slot_no", slotNo);
+  prefs.putBool("r4_act_hi", pin4ActiveHigh);
   prefs.putBool("r2_act_hi", pin2ActiveHigh);
   prefs.putBool("r22_act_hi", pin22ActiveHigh);
   prefs.end();
@@ -429,16 +441,127 @@ void publishMaintenanceStatus() {
   }
 }
 
+bool isInputOnlyPin(uint8_t pin) {
+  return pin == 34 || pin == 35 || pin == 36 || pin == 39;
+}
+
+bool isDebugPinAllowed(int pin) {
+  if (pin < 0 || pin > 39) return false;
+
+  for (size_t i = 0; i < (sizeof(DEBUG_PINS) / sizeof(DEBUG_PINS[0])); i++) {
+    if ((int)DEBUG_PINS[i] == pin) return true;
+  }
+  return false;
+}
+
+String debugPinLabel(uint8_t pin) {
+  if (pin == LED_status) return "LED_status";
+  if (pin == BUTTON_PIN) return "BUTTON_PIN";
+  if (pin == LED_BUTTON) return "LED_BUTTON";
+  if (pin == LED_ACTION) return "LED_ACTION";
+  if (pin == LED_ACTION_INV) return "LED_ACTION_INV";
+  return "-";
+}
+
+String debugPinModeLabel(uint8_t pin) {
+  if (isInputOnlyPin(pin)) return "INPUT_ONLY";
+  if (pin == BUTTON_PIN) return "INPUT_PULLUP";
+  if (pin == LED_status || pin == LED_BUTTON || pin == LED_ACTION || pin == LED_ACTION_INV) return "OUTPUT";
+  return "UNKNOWN";
+}
+
+String buildDebugPinsSection() {
+  String html;
+  html.reserve(5000);
+
+  html += "<hr><h3 id='debug'>Debug GPIO Pin Yang Digunakan</h3>";
+  if (debugMessage.length() > 0) {
+    html += "<div class='row'><b>Debug:</b> ";
+    html += debugMessage;
+    html += "</div>";
+  }
+
+  html += "<p><small>Catatan: aksi debug pada pin yang dipakai aplikasi bisa tertimpa logika loop normal.</small></p>";
+  html += "<div style='overflow-x:auto;'><table class='pins'>";
+  html += "<tr><th>GPIO</th><th>Level</th><th>Mode</th><th>Fungsi</th><th>Aksi</th></tr>";
+
+  for (size_t i = 0; i < (sizeof(DEBUG_PINS) / sizeof(DEBUG_PINS[0])); i++) {
+    uint8_t pin = DEBUG_PINS[i];
+    int level = digitalRead(pin);
+
+    html += (pin == BUTTON_PIN) ? "<tr class='button-pin'><td>" : "<tr><td>";
+    html += String(pin);
+    html += "</td><td>";
+    html += (level == HIGH ? "HIGH" : "LOW");
+    html += "</td><td>";
+    html += debugPinModeLabel(pin);
+    html += "</td><td>";
+    html += debugPinLabel(pin);
+    html += "</td><td>";
+
+    html += "<form class='pin-actions' method='POST' action='/debug/pin'>";
+    html += "<input type='hidden' name='pin' value='";
+    html += String(pin);
+    html += "'>";
+    html += "<button type='submit' name='action' value='read'>READ</button>";
+
+    if (!isInputOnlyPin(pin)) {
+      html += "<button type='submit' name='action' value='high'>HIGH</button>";
+      html += "<button type='submit' name='action' value='low'>LOW</button>";
+      html += "<button type='submit' name='action' value='input'>INPUT</button>";
+      html += "<button type='submit' name='action' value='pullup'>PULLUP</button>";
+    }
+
+    html += "</form></td></tr>";
+  }
+
+  html += "</table></div>";
+  return html;
+}
+
+String htmlPinPage(const String& errorMessage) {
+  String html;
+  html.reserve(1800);
+  html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>IoT Boseh - PIN</title>";
+  html += "<style>body{font-family:Arial,sans-serif;background:#f5f7fb;margin:0;padding:20px;}";
+  html += ".card{max-width:420px;margin:40px auto;background:#fff;padding:24px;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.08);}";
+  html += "h2{margin-top:0;}label{display:block;margin-top:12px;font-weight:600;}input{width:100%;padding:12px;margin-top:6px;border:1px solid #ccc;border-radius:8px;background:#fff;font-size:20px;letter-spacing:6px;text-align:center;}";
+  html += "button{margin-top:16px;padding:10px 16px;border:0;background:#0066cc;color:#fff;border-radius:8px;cursor:pointer;}";
+  html += ".err{margin-top:12px;background:#fee2e2;color:#991b1b;padding:10px;border-radius:8px;font-size:14px;}</style></head><body>";
+  html += "<div class='card'><h2>Boseh Dashboard Lock</h2>";
+  html += "<form method='POST' action='/unlock'>";
+  html += "<label>Masukkan PIN 4 Digit</label>";
+  html += "<input name='pin' type='password' inputmode='numeric' pattern='[0-9]{4}' maxlength='4' minlength='4' required autofocus>";
+  html += "<button type='submit'>Buka Dashboard</button></form>";
+  if (errorMessage.length() > 0) {
+    html += "<div class='err'>";
+    html += errorMessage;
+    html += "</div>";
+  }
+  html += "</div></body></html>";
+  return html;
+}
+
+bool requireDashboardUnlocked() {
+  if (dashboardUnlocked) return true;
+  server.sendHeader("Location", "/");
+  server.send(303);
+  return false;
+}
 String htmlPage() {
   String html;
-  html.reserve(3500);
+  html.reserve(9000);
   html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>IoT Boseh</title>";
   html += "<style>body{font-family:Arial,sans-serif;background:#f5f7fb;margin:0;padding:20px;}";
-  html += ".card{max-width:700px;margin:auto;background:#fff;padding:20px;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.08);}h2{margin-top:0;}";
+  html += ".card{max-width:960px;margin:auto;background:#fff;padding:20px;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.08);}h2{margin-top:0;}";
   html += "label{display:block;margin-top:12px;font-weight:600;}input,select{width:100%;padding:10px;margin-top:6px;border:1px solid #ccc;border-radius:8px;background:#fff;}";
-  html += "button{margin-top:16px;padding:10px 16px;border:0;background:#0066cc;color:#fff;border-radius:8px;cursor:pointer;}";
-  html += "small{color:#666;} .row{margin-top:12px;padding:10px;background:#f1f5f9;border-radius:8px;}</style></head><body>";
+  html += "button{margin-top:8px;margin-right:6px;padding:8px 12px;border:0;background:#0066cc;color:#fff;border-radius:8px;cursor:pointer;font-size:12px;}";
+  html += "small{color:#666;} .row{margin-top:12px;padding:10px;background:#f1f5f9;border-radius:8px;}";
+  html += "table.pins{width:100%;border-collapse:collapse;font-size:13px;}table.pins th,table.pins td{border:1px solid #d7dce3;padding:8px;text-align:left;vertical-align:top;}";
+  html += "table.pins th{background:#eef2f7;}table.pins tr.button-pin td{background:#fff6d6;font-weight:600;}form.pin-actions{display:flex;flex-wrap:wrap;gap:6px;}";
+  html += "</style></head><body>";
   html += "<div class='card'><h2>Boseh Device Config</h2>";
   html += "<div class='row'><b>WiFi STA IP:</b> ";
   html += WiFi.localIP().toString();
@@ -452,7 +575,10 @@ String htmlPage() {
   html += "<label>WiFi Password</label><input name='password' type='password' value='" + wifiPasswordConfig + "'>";
   html += "<label>MQTT Broker IP</label><input name='mqtt' value='" + mqttServerConfig + "' required>";
   html += "<label>Slot Number</label><input name='slot' type='number' min='1' value='" + String(slotNumberConfig) + "' required>";
-  html += "<label>Relay Pin2 Active Level</label><select name='r2_active'>";
+  html += "<label>Relay Pin4 Active Level (LED_ACTION)</label><select name='r4_active'>";
+  html += relayPin4ActiveHigh ? "<option value='high' selected>HIGH</option><option value='low'>LOW</option>" : "<option value='high'>HIGH</option><option value='low' selected>LOW</option>";
+  html += "</select>";
+  html += "<label>Relay Pin2 Active Level (LED_status)</label><select name='r2_active'>";
   html += relayPin2ActiveHigh ? "<option value='high' selected>HIGH</option><option value='low'>LOW</option>" : "<option value='high'>HIGH</option><option value='low' selected>LOW</option>";
   html += "</select>";
   html += "<label>Relay Pin22 Active Level</label><select name='r22_active'>";
@@ -464,22 +590,41 @@ String htmlPage() {
   html += "<input type='file' name='firmware' accept='.bin' required>";
   html += "<button type='submit'>Upload OTA</button></form>";
   html += "<p><small>Setelah simpan config, device akan reconnect WiFi/MQTT otomatis. OTA akan reboot saat sukses.</small></p>";
+  html += buildDebugPinsSection();
   html += "</div></body></html>";
   return html;
 }
 
 void handleRoot() {
+  if (!dashboardUnlocked) {
+    server.send(200, "text/html", htmlPinPage(""));
+    return;
+  }
   server.send(200, "text/html", htmlPage());
 }
 
+void handleUnlock() {
+  String pin = server.arg("pin");
+  if (pin == DASHBOARD_PIN) {
+    dashboardUnlocked = true;
+    server.sendHeader("Location", "/");
+    server.send(303);
+    return;
+  }
+  server.send(200, "text/html", htmlPinPage("PIN salah, coba lagi."));
+}
+
 void handleSaveConfig() {
+  if (!requireDashboardUnlocked()) return;
   String ssid = server.arg("ssid");
   String pass = server.arg("password");
   String mqtt = server.arg("mqtt");
   int slot = server.arg("slot").toInt();
+  String relayPin4Arg = server.arg("r4_active");
   String relayPin2Arg = server.arg("r2_active");
   String relayPin22Arg = server.arg("r22_active");
 
+  bool pin4ActiveHigh = !(relayPin4Arg == "low" || relayPin4Arg == "LOW" || relayPin4Arg == "0");
   bool pin2ActiveHigh = !(relayPin2Arg == "low" || relayPin2Arg == "LOW" || relayPin2Arg == "0");
   bool pin22ActiveHigh = !(relayPin22Arg == "low" || relayPin22Arg == "LOW" || relayPin22Arg == "0");
 
@@ -492,10 +637,12 @@ void handleSaveConfig() {
   wifiPasswordConfig = pass;
   mqttServerConfig = mqtt;
   slotNumberConfig = slot;
+  relayPin4ActiveHigh = pin4ActiveHigh;
   relayPin2ActiveHigh = pin2ActiveHigh;
   relayPin22ActiveHigh = pin22ActiveHigh;
-  saveConfig(wifiSsidConfig, wifiPasswordConfig, mqttServerConfig, slotNumberConfig, relayPin2ActiveHigh, relayPin22ActiveHigh);
+  saveConfig(wifiSsidConfig, wifiPasswordConfig, mqttServerConfig, slotNumberConfig, relayPin4ActiveHigh, relayPin2ActiveHigh, relayPin22ActiveHigh);
   updateMqttControlTopic();
+  setStatusLed(tagDetected);
   setActionLed(solenoidState);
   setMirrorLed(solenoidState);
 
@@ -508,7 +655,65 @@ void handleSaveConfig() {
   server.send(200, "text/html", "<html><body><h3>Config tersimpan.</h3><a href='/'>Kembali</a></body></html>");
 }
 
+void handleDebugPin() {
+  if (!requireDashboardUnlocked()) return;
+  int pin = server.arg("pin").toInt();
+  String action = server.arg("action");
+
+  if (!isDebugPinAllowed(pin)) {
+    debugMessage = "GPIO tidak diizinkan untuk debug";
+    server.sendHeader("Location", "/#debug");
+    server.send(303);
+    return;
+  }
+
+  if (action == "read") {
+    int level = digitalRead(pin);
+    debugMessage = "GPIO" + String(pin) + " = " + (level == HIGH ? "HIGH" : "LOW");
+  } else if (action == "high") {
+    if (isInputOnlyPin((uint8_t)pin)) {
+      debugMessage = "GPIO" + String(pin) + " hanya input";
+    } else {
+      pinMode(pin, OUTPUT);
+      digitalWrite(pin, HIGH);
+      debugMessage = "GPIO" + String(pin) + " diset HIGH";
+    }
+  } else if (action == "low") {
+    if (isInputOnlyPin((uint8_t)pin)) {
+      debugMessage = "GPIO" + String(pin) + " hanya input";
+    } else {
+      pinMode(pin, OUTPUT);
+      digitalWrite(pin, LOW);
+      debugMessage = "GPIO" + String(pin) + " diset LOW";
+    }
+  } else if (action == "input") {
+    if (isInputOnlyPin((uint8_t)pin)) {
+      debugMessage = "GPIO" + String(pin) + " sudah mode input-only";
+    } else {
+      pinMode(pin, INPUT);
+      debugMessage = "GPIO" + String(pin) + " diset INPUT";
+    }
+  } else if (action == "pullup") {
+    if (isInputOnlyPin((uint8_t)pin)) {
+      debugMessage = "GPIO" + String(pin) + " tidak mendukung pullup via pinMode ini";
+    } else {
+      pinMode(pin, INPUT_PULLUP);
+      debugMessage = "GPIO" + String(pin) + " diset INPUT_PULLUP";
+    }
+  } else {
+    debugMessage = "Aksi debug tidak dikenali";
+  }
+
+  if (pin == LED_status || pin == BUTTON_PIN || pin == LED_BUTTON || pin == LED_ACTION || pin == LED_ACTION_INV) {
+    debugMessage += " (pin ini dipakai oleh aplikasi utama)";
+  }
+
+  server.sendHeader("Location", "/#debug");
+  server.send(303);
+}
+
 void handleUpdateUpload() {
+  if (!dashboardUnlocked) return;
   HTTPUpload& upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
@@ -530,6 +735,7 @@ void handleUpdateUpload() {
 }
 
 void handleUpdateDone() {
+  if (!requireDashboardUnlocked()) return;
   if (Update.hasError()) {
     server.send(500, "text/plain", "OTA gagal");
     return;
@@ -542,7 +748,9 @@ void handleUpdateDone() {
 
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/unlock", HTTP_POST, handleUnlock);
   server.on("/save", HTTP_POST, handleSaveConfig);
+  server.on("/debug/pin", HTTP_POST, handleDebugPin);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.begin();
   Serial.println("Web dashboard aktif di port 80");
@@ -658,7 +866,7 @@ void setup() {
   pinMode(LED_ACTION, OUTPUT);
   pinMode(LED_ACTION_INV, OUTPUT);
 
-  digitalWrite(LED_status, HIGH);
+  setStatusLed(false);
   digitalWrite(LED_BUTTON, HIGH);
   setActionLed(false);
   setMirrorLed(false);
@@ -728,7 +936,7 @@ void loop() {
       Serial.print(millis());
       Serial.println(" ms");
       Serial.println("-----------------------------------");
-      digitalWrite(LED_status, LOW);
+      setStatusLed(true);
       lastCardRfidTag = tagID;
       if (inRange) {
         publishConfirmOpen(lastCardRfidTag, true);
@@ -742,7 +950,7 @@ void loop() {
   if (!inRange && tagDetected) {
     tagDetected = false;
     Serial.println("Tag keluar range\n");
-    digitalWrite(LED_status, HIGH);
+    setStatusLed(false);
     if (lastCardRfidTag.length() > 0) {
       publishConfirmOpen(lastCardRfidTag, false);
     } else {
@@ -789,5 +997,14 @@ void loop() {
   lastButtonState = buttonPressed;
   delay(50);
 }
+
+
+
+
+
+
+
+
+
 
 
