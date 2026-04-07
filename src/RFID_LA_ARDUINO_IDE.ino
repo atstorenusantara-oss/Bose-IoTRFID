@@ -22,7 +22,7 @@ const char* MQTT_SERVER_DEFAULT = "192.168.0.177";
 const int   MQTT_PORT = 1883;
 const int   SLOT_NUMBER_DEFAULT = 1;
 
-const char* MQTT_STATUS_TOPIC = "boseh/status";
+const char* MQTT_STATUS_TOPIC_BASE = "boseh/status";
 const char* MQTT_READY_TOPIC = "boseh/ready";
 const char* MQTT_CONFIRM_TOPIC = "boseh/stasiun/confirm_open";
 const char* MQTT_MAINT_TOPIC = "boseh/maintenance";
@@ -31,6 +31,7 @@ String wifiSsidConfig = WIFI_SSID_DEFAULT;
 String wifiPasswordConfig = WIFI_PASSWORD_DEFAULT;
 String mqttServerConfig = MQTT_SERVER_DEFAULT;
 int slotNumberConfig = SLOT_NUMBER_DEFAULT;
+String mqttStatusTopic = "";
 String mqttControlTopic = "";
 String mqttStatusRequestTopic = "";
 
@@ -58,6 +59,7 @@ String currentBikeId = "";
 String lastStatusRfidTag = "";
 String lastCardRfidTag = "";
 bool solenoidState = false;
+bool confirmOpenSentInCurrentRange = false;
 
 bool apModeActive = false;
 bool relayPin4ActiveHigh = false;
@@ -222,6 +224,9 @@ bool extractValidTagFromRawHex(const String& rawHex, String* outTag) {
 }
 
 void updateMqttControlTopic() {
+  mqttStatusTopic = MQTT_STATUS_TOPIC_BASE;
+  mqttStatusTopic += "/";
+  mqttStatusTopic += String(slotNumberConfig);
   mqttControlTopic = "boseh/device/";
   mqttControlTopic += String(slotNumberConfig);
   mqttControlTopic += "/control";
@@ -325,9 +330,11 @@ void connectMQTT() {
   while (!mqttClient.connected() && (millis() - start) < 10000) {
     if (mqttClient.connect(clientId.c_str())) {
       Serial.println(" connected");
-      mqttClient.subscribe(MQTT_STATUS_TOPIC);
-      Serial.print("Subscribed to: ");
-      Serial.println(MQTT_STATUS_TOPIC);
+      if (mqttStatusTopic.length() > 0) {
+        mqttClient.subscribe(mqttStatusTopic.c_str());
+        Serial.print("Subscribed to: ");
+        Serial.println(mqttStatusTopic);
+      }
       if (mqttControlTopic.length() > 0) {
         mqttClient.subscribe(mqttControlTopic.c_str());
         Serial.print("Subscribed to: ");
@@ -687,12 +694,8 @@ void handleDebugPin() {
       debugMessage = "GPIO" + String(pin) + " diset LOW";
     }
   } else if (action == "input") {
-    if (isInputOnlyPin((uint8_t)pin)) {
-      debugMessage = "GPIO" + String(pin) + " sudah mode input-only";
-    } else {
-      pinMode(pin, INPUT);
-      debugMessage = "GPIO" + String(pin) + " diset INPUT";
-    }
+    pinMode(pin, INPUT);
+    debugMessage = "GPIO" + String(pin) + " diset INPUT";
   } else if (action == "pullup") {
     if (isInputOnlyPin((uint8_t)pin)) {
       debugMessage = "GPIO" + String(pin) + " tidak mendukung pullup via pinMode ini";
@@ -768,11 +771,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.print("]: ");
   Serial.println(message);
 
-  if (strcmp(topic, MQTT_STATUS_TOPIC) == 0) {
-    int slot = parseSlotNumber(message);
+  if (mqttStatusTopic.length() > 0 && strcmp(topic, mqttStatusTopic.c_str()) == 0) {
     String rfidTag = parseJsonString(message, "rfid_tag");
-    if (slot < 0) {
-      Serial.println("slot_number tidak ditemukan");
+    if (rfidTag.length() == 0) {
+      Serial.println("rfid_tag tidak ditemukan");
       if (buttonWaitActive && !actionActive) {
         setMirrorLed(false);
         solenoidState = false;
@@ -783,29 +785,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       return;
     }
 
-    if (slot == slotNumberConfig) {
-      currentBikeId = rfidTag;
-      lastStatusRfidTag = rfidTag;
-      buttonWaitActive = true;
-      // Pin 22 jadi indikator status: nyala saat slot cocok.
-      setMirrorLed(true);
-      solenoidState = true;
-      Serial.print("slot_number cocok: ");
-      Serial.println(slot);
-      Serial.print("rfid_tag: ");
-      Serial.println(currentBikeId);
-      Serial.println("Status cocok: LED indikator pin22 ON, menunggu tombol");
-    } else {
-      if (buttonWaitActive && !actionActive) {
-        setMirrorLed(false);
-        solenoidState = false;
-      }
-      buttonWaitActive = false;
-      currentBikeId = "";
-      lastStatusRfidTag = "";
-      Serial.print("slot number tidak sama: ");
-      Serial.println(slot);
-    }
+    currentBikeId = rfidTag;
+    lastStatusRfidTag = rfidTag;
+    buttonWaitActive = true;
+    // Pin 22 jadi indikator status: nyala saat status masuk topic slot ini.
+    setMirrorLed(true);
+    solenoidState = true;
+    Serial.print("status topic cocok: ");
+    Serial.println(mqttStatusTopic);
+    Serial.print("rfid_tag: ");
+    Serial.println(currentBikeId);
+    Serial.println("Status diterima: LED indikator pin22 ON, menunggu tombol");
     return;
   }
 
@@ -853,7 +843,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 }
-
 void setup() {
   Serial.begin(115200);
   RFIDSerial.begin(9600, SERIAL_8N1, RX_PIN, -1);
@@ -896,12 +885,9 @@ void loop() {
 
   if (inRange && !tagDetected) {
     tagDetected = true;
+    confirmOpenSentInCurrentRange = false;
     Serial.println("TAG MASUK RANGE!");
-    if (lastCardRfidTag.length() > 0) {
-      publishConfirmOpen(lastCardRfidTag, true);
-    } else {
-      Serial.println("Menunggu RFID terbaca untuk kirim confirm_open status=true");
-    }
+    Serial.println("Menunggu RFID terbaru untuk kirim confirm_open status=true");
   }
 
   if (RFIDSerial.available() > 0) {
@@ -938,8 +924,9 @@ void loop() {
       Serial.println("-----------------------------------");
       setStatusLed(true);
       lastCardRfidTag = tagID;
-      if (inRange) {
+      if (inRange && !confirmOpenSentInCurrentRange) {
         publishConfirmOpen(lastCardRfidTag, true);
+        confirmOpenSentInCurrentRange = true;
       }
     } else if (rawHex.length() > 0) {
       Serial.print("Frame RFID tidak valid/kurang lengkap, retry: ");
@@ -949,6 +936,7 @@ void loop() {
 
   if (!inRange && tagDetected) {
     tagDetected = false;
+    confirmOpenSentInCurrentRange = false;
     Serial.println("Tag keluar range\n");
     setStatusLed(false);
     if (lastCardRfidTag.length() > 0) {
@@ -997,6 +985,10 @@ void loop() {
   lastButtonState = buttonPressed;
   delay(50);
 }
+
+
+
+
 
 
 
