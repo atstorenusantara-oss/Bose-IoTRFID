@@ -31,6 +31,11 @@ String wifiSsidConfig = WIFI_SSID_DEFAULT;
 String wifiPasswordConfig = WIFI_PASSWORD_DEFAULT;
 String mqttServerConfig = MQTT_SERVER_DEFAULT;
 int slotNumberConfig = SLOT_NUMBER_DEFAULT;
+bool wifiUseStaticConfig = false;
+String wifiStaticIpConfig = "";
+String wifiGatewayConfig = "";
+String wifiSubnetConfig = "";
+String wifiDnsConfig = "";
 String mqttControlTopic = "";
 String mqttStatusRequestTopic = "";
 
@@ -60,6 +65,21 @@ bool solenoidState = false;
 bool apModeActive = false;
 bool relayPin2ActiveHigh = true;
 bool relayPin22ActiveHigh = false;
+
+bool parseIPv4(const String& text, IPAddress* outIp) {
+  String trimmed = text;
+  trimmed.trim();
+  if (trimmed.length() == 0) return false;
+
+  IPAddress parsed;
+  if (!parsed.fromString(trimmed)) return false;
+  if (outIp) *outIp = parsed;
+  return true;
+}
+
+bool isZeroIp(const IPAddress& ip) {
+  return ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0;
+}
 
 void writeOutputActiveLevel(uint8_t pin, bool active, bool activeHigh) {
   digitalWrite(pin, active ? (activeHigh ? HIGH : LOW) : (activeHigh ? LOW : HIGH));
@@ -225,6 +245,11 @@ void loadConfig() {
   wifiPasswordConfig = prefs.getString("wifi_pass", WIFI_PASSWORD_DEFAULT);
   mqttServerConfig = prefs.getString("mqtt_ip", MQTT_SERVER_DEFAULT);
   slotNumberConfig = prefs.getInt("slot_no", SLOT_NUMBER_DEFAULT);
+  wifiUseStaticConfig = prefs.getBool("wifi_static", false);
+  wifiStaticIpConfig = prefs.getString("sta_ip", "");
+  wifiGatewayConfig = prefs.getString("sta_gw", "");
+  wifiSubnetConfig = prefs.getString("sta_sn", "");
+  wifiDnsConfig = prefs.getString("sta_dns", "");
   relayPin2ActiveHigh = prefs.getBool("r2_act_hi", true);
   relayPin22ActiveHigh = prefs.getBool("r22_act_hi", false);
   prefs.end();
@@ -233,12 +258,29 @@ void loadConfig() {
   updateMqttControlTopic();
 }
 
-void saveConfig(const String& ssid, const String& pass, const String& mqttIp, int slotNo, bool pin2ActiveHigh, bool pin22ActiveHigh) {
+void saveConfig(
+  const String& ssid,
+  const String& pass,
+  const String& mqttIp,
+  int slotNo,
+  bool useStatic,
+  const String& staIp,
+  const String& staGw,
+  const String& staSn,
+  const String& staDns,
+  bool pin2ActiveHigh,
+  bool pin22ActiveHigh
+) {
   prefs.begin("cfg", false);
   prefs.putString("wifi_ssid", ssid);
   prefs.putString("wifi_pass", pass);
   prefs.putString("mqtt_ip", mqttIp);
   prefs.putInt("slot_no", slotNo);
+  prefs.putBool("wifi_static", useStatic);
+  prefs.putString("sta_ip", staIp);
+  prefs.putString("sta_gw", staGw);
+  prefs.putString("sta_sn", staSn);
+  prefs.putString("sta_dns", staDns);
   prefs.putBool("r2_act_hi", pin2ActiveHigh);
   prefs.putBool("r22_act_hi", pin22ActiveHigh);
   prefs.end();
@@ -279,6 +321,52 @@ void connectWiFi(bool allowApFallback) {
   if (WiFi.status() == WL_CONNECTED) return;
 
   WiFi.mode(WIFI_STA);
+  if (wifiUseStaticConfig) {
+    IPAddress localIp;
+    IPAddress gateway;
+    IPAddress subnet;
+    IPAddress dns;
+
+    bool validLocal = parseIPv4(wifiStaticIpConfig, &localIp);
+    bool validGateway = parseIPv4(wifiGatewayConfig, &gateway);
+    bool validSubnet = parseIPv4(wifiSubnetConfig, &subnet);
+    bool validDns = true;
+    if (wifiDnsConfig.length() > 0) {
+      validDns = parseIPv4(wifiDnsConfig, &dns);
+    }
+
+    if (!validLocal || !validGateway || !validSubnet || !validDns || isZeroIp(localIp) || isZeroIp(gateway) || isZeroIp(subnet)) {
+      Serial.println("Konfigurasi static IP tidak valid, WiFi tidak dijalankan");
+      if (allowApFallback) {
+        Serial.println("Masuk AP fallback");
+        startFallbackAP();
+      }
+      return;
+    }
+
+    bool configOk = false;
+    if (wifiDnsConfig.length() > 0) {
+      configOk = WiFi.config(localIp, gateway, subnet, dns);
+    } else {
+      configOk = WiFi.config(localIp, gateway, subnet);
+    }
+
+    if (!configOk) {
+      Serial.println("Gagal menerapkan static IP");
+      if (allowApFallback) {
+        Serial.println("Masuk AP fallback");
+        startFallbackAP();
+      }
+      return;
+    }
+
+    Serial.print("Mode WiFi: STATIC (");
+    Serial.print(localIp);
+    Serial.println(")");
+  } else {
+    Serial.println("Mode WiFi: DHCP");
+  }
+
   WiFi.begin(wifiSsidConfig.c_str(), wifiPasswordConfig.c_str());
   Serial.print("Connecting WiFi");
 
@@ -431,7 +519,7 @@ void publishMaintenanceStatus() {
 
 String htmlPage() {
   String html;
-  html.reserve(3500);
+  html.reserve(5500);
   html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>IoT Boseh</title>";
   html += "<style>body{font-family:Arial,sans-serif;background:#f5f7fb;margin:0;padding:20px;}";
@@ -446,12 +534,22 @@ String htmlPage() {
   html += WiFi.softAPIP().toString();
   html += "<br><b>MQTT Broker:</b> ";
   html += mqttServerConfig;
+  html += "<br><b>WiFi Mode:</b> ";
+  html += (wifiUseStaticConfig ? "STATIC IP" : "DHCP");
   html += "</div>";
   html += "<form method='POST' action='/save'>";
   html += "<label>WiFi SSID</label><input name='ssid' value='" + wifiSsidConfig + "' required>";
   html += "<label>WiFi Password</label><input name='password' type='password' value='" + wifiPasswordConfig + "'>";
   html += "<label>MQTT Broker IP</label><input name='mqtt' value='" + mqttServerConfig + "' required>";
   html += "<label>Slot Number</label><input name='slot' type='number' min='1' value='" + String(slotNumberConfig) + "' required>";
+  html += "<label>IP Mode</label><select name='ip_mode'>";
+  html += wifiUseStaticConfig ? "<option value='dhcp'>DHCP</option><option value='static' selected>STATIC</option>" : "<option value='dhcp' selected>DHCP</option><option value='static'>STATIC</option>";
+  html += "</select>";
+  html += "<label>Static IP</label><input name='sta_ip' placeholder='contoh: 192.168.1.50' value='" + wifiStaticIpConfig + "'>";
+  html += "<label>Gateway</label><input name='sta_gw' placeholder='contoh: 192.168.1.1' value='" + wifiGatewayConfig + "'>";
+  html += "<label>Subnet Mask</label><input name='sta_sn' placeholder='contoh: 255.255.255.0' value='" + wifiSubnetConfig + "'>";
+  html += "<label>DNS (opsional)</label><input name='sta_dns' placeholder='contoh: 8.8.8.8' value='" + wifiDnsConfig + "'>";
+  html += "<small>Jika IP Mode = STATIC, field Static IP/Gateway/Subnet wajib valid.</small>";
   html += "<label>Relay Pin2 Active Level</label><select name='r2_active'>";
   html += relayPin2ActiveHigh ? "<option value='high' selected>HIGH</option><option value='low'>LOW</option>" : "<option value='high'>HIGH</option><option value='low' selected>LOW</option>";
   html += "</select>";
@@ -477,24 +575,70 @@ void handleSaveConfig() {
   String pass = server.arg("password");
   String mqtt = server.arg("mqtt");
   int slot = server.arg("slot").toInt();
+  String ipMode = server.arg("ip_mode");
+  String staIp = server.arg("sta_ip");
+  String staGw = server.arg("sta_gw");
+  String staSn = server.arg("sta_sn");
+  String staDns = server.arg("sta_dns");
   String relayPin2Arg = server.arg("r2_active");
   String relayPin22Arg = server.arg("r22_active");
 
+  staIp.trim();
+  staGw.trim();
+  staSn.trim();
+  staDns.trim();
+
   bool pin2ActiveHigh = !(relayPin2Arg == "low" || relayPin2Arg == "LOW" || relayPin2Arg == "0");
   bool pin22ActiveHigh = !(relayPin22Arg == "low" || relayPin22Arg == "LOW" || relayPin22Arg == "0");
+  bool useStaticIp = (ipMode == "static" || ipMode == "STATIC");
 
   if (ssid.length() == 0 || mqtt.length() == 0 || slot <= 0) {
     server.send(400, "text/plain", "Parameter tidak valid");
     return;
   }
 
+  if (useStaticIp) {
+    IPAddress localIp;
+    IPAddress gateway;
+    IPAddress subnet;
+    IPAddress dns;
+
+    bool validLocal = parseIPv4(staIp, &localIp);
+    bool validGateway = parseIPv4(staGw, &gateway);
+    bool validSubnet = parseIPv4(staSn, &subnet);
+    bool validDns = true;
+    if (staDns.length() > 0) validDns = parseIPv4(staDns, &dns);
+
+    if (!validLocal || !validGateway || !validSubnet || !validDns || isZeroIp(localIp) || isZeroIp(gateway) || isZeroIp(subnet)) {
+      server.send(400, "text/plain", "Static IP/Gateway/Subnet/DNS tidak valid");
+      return;
+    }
+  }
+
   wifiSsidConfig = ssid;
   wifiPasswordConfig = pass;
   mqttServerConfig = mqtt;
   slotNumberConfig = slot;
+  wifiUseStaticConfig = useStaticIp;
+  wifiStaticIpConfig = staIp;
+  wifiGatewayConfig = staGw;
+  wifiSubnetConfig = staSn;
+  wifiDnsConfig = staDns;
   relayPin2ActiveHigh = pin2ActiveHigh;
   relayPin22ActiveHigh = pin22ActiveHigh;
-  saveConfig(wifiSsidConfig, wifiPasswordConfig, mqttServerConfig, slotNumberConfig, relayPin2ActiveHigh, relayPin22ActiveHigh);
+  saveConfig(
+    wifiSsidConfig,
+    wifiPasswordConfig,
+    mqttServerConfig,
+    slotNumberConfig,
+    wifiUseStaticConfig,
+    wifiStaticIpConfig,
+    wifiGatewayConfig,
+    wifiSubnetConfig,
+    wifiDnsConfig,
+    relayPin2ActiveHigh,
+    relayPin22ActiveHigh
+  );
   updateMqttControlTopic();
   setActionLed(solenoidState);
   setMirrorLed(solenoidState);
