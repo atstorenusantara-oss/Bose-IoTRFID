@@ -1,121 +1,169 @@
-# Dokumentasi ESP32 RFID + MQTT + Dashboard OTA
+# Dokumentasi Perangkat RFID Boseh (ESP32 + ID-12LA)
 
-## Ringkasan Fitur
-- Baca RFID ID-12LA via UART2.
-- Subscribe MQTT topic:
-  - `boseh/status` (validasi slot untuk `bike_id`)
-  - `boseh/device/<slot>/control` (kontrol solenoid/LED)
-  - `boseh/<slot>` (request publish maintenance)
-- Publish MQTT:
-  - `boseh/ready`
-  - `boseh/stasiun/confirm_open`
-  - `boseh/maintenance`
-- Dashboard web untuk update konfigurasi tanpa edit kode.
-- OTA firmware upload dari browser.
-- Penyimpanan konfigurasi persisten dengan `Preferences` (NVS).
-- Mode AP fallback hanya aktif jika konek WiFi awal (saat boot) gagal >15 detik.
-- Saat AP fallback aktif, perangkat hanya melayani dashboard konfigurasi (fungsi lain dihentikan sementara).
+Dokumen ini mengikuti implementasi terbaru pada `src/RFID_LA_ARDUINO_IDE.ino`.
+Fitur utama: pembacaan RFID ID-12LA, kontrol output/solenoid, dashboard konfigurasi web, OTA update, dan komunikasi MQTT.
 
-## Konfigurasi Yang Bisa Diubah Dari Dashboard
-- `WiFi SSID`
-- `WiFi Password`
-- `MQTT Broker IP`
-- `Slot Number`
+## 1. Ringkasan Fitur
 
-Semua konfigurasi tersimpan permanen dan dipakai saat reboot berikutnya.
+- Baca RFID dari UART2 (`RX GPIO16`) dan pin deteksi range (`GPIO17`)
+- Validasi frame RFID dengan checksum XOR (10 hex tag + 2 hex checksum)
+- Publish event RFID/aksi ke MQTT
+- Subscribe topic kontrol dan permintaan status maintenance
+- Dashboard web untuk:
+  - unlock PIN
+  - set WiFi, MQTT IP, slot
+  - set level aktif relay (HIGH/LOW)
+  - debug GPIO
+  - upload firmware OTA (`.bin`)
+- AP fallback otomatis saat gagal konek WiFi STA
 
-## Nilai Default Konfigurasi
-- `WiFi SSID`: `Bapa`
-- `WiFi Password`: `12345678901`
-- `MQTT Broker IP`: `192.168.0.105`
-- `MQTT Port`: `1883`
-- `Slot Number`: `1`
+## 2. Mapping Pin Perangkat
 
-## Akses Dashboard
-1. Nyalakan ESP32 dan lihat Serial Monitor untuk IP.
-2. Buka browser ke `http://<IP-ESP32>/`.
-3. Ubah konfigurasi lalu klik `Simpan Config`.
+| Fungsi | GPIO | Keterangan |
+| :--- | :--- | :--- |
+| RFID D0 (UART RX) | 16 | ID-12LA pin 9 |
+| Tag In Range | 17 | ID-12LA pin 6 |
+| LED status RFID | 2 | `LED_status` |
+| Tombol input | 23 | `BUTTON_PIN`, `INPUT_PULLUP` |
+| LED tombol | 15 | Aktif LOW |
+| Output aksi / relay | 4 | `LED_ACTION` |
+| LED indikator mirror | 22 | `LED_ACTION_INV` |
 
-Jika WiFi gagal terkoneksi saat boot, ESP32 otomatis masuk AP fallback:
-- SSID: `BOSEH-Config-<slot_number>`
-- Password: `12345678`
-- IP AP: `192.168.4.<slot_number>` (dibatasi ke rentang 2..254 agar valid)
+## 3. Konfigurasi Default
 
-Catatan:
-- Setelah konfigurasi disimpan dan WiFi berhasil tersambung, AP fallback akan dimatikan.
-- Di runtime, jika WiFi putus, perangkat hanya melakukan reconnect WiFi (tanpa mengaktifkan AP fallback lagi).
+- WiFi SSID: `TUBIS43LT2`
+- WiFi Password: `12345678`
+- MQTT Broker: `192.168.0.177`
+- MQTT Port: `1883`
+- Slot default: `1`
+- PIN dashboard: `1221`
+- AP fallback SSID: `BOSEH-Config-{slot_number}`
+- AP fallback password: `12345678`
 
-## OTA Firmware (Web)
-1. Buka dashboard `http://<IP-ESP32>/`.
-2. Di bagian `OTA Firmware Update`, pilih file `.bin`.
-3. Klik `Upload OTA`.
-4. Jika sukses, perangkat reboot otomatis.
+Semua konfigurasi tersimpan di NVS (`Preferences`) namespace `cfg`.
 
-## Alur MQTT
-### Subscribe
-- Topic: `boseh/status`
-- Contoh payload:
+## 4. MQTT (Aktual di Firmware)
+
+### 4.1 Topic Subscribe (device menerima)
+
+- `boseh/status/{slot_number}`
+  - Dipakai untuk status slot (ambil `rfid_tag`)
+- `boseh/device/{slot_number}/control`
+  - Dipakai untuk command kontrol solenoid
+- `boseh/{slot_number}`
+  - Dipakai untuk trigger kirim status maintenance (`{"status":true}`)
+
+### 4.2 Topic Publish (device mengirim)
+
+- `boseh/stasiun/confirm_open`
+  - Payload:
+  ```json
+  {
+    "slot_number": 1,
+    "rfid_tag": "A1B2C3D4E5FF",
+    "status": true
+  }
+  ```
+- `boseh/maintenance`
+  - Payload:
+  ```json
+  {
+    "slot_number": 1,
+    "ip_address": "192.168.1.20",
+    "status": true,
+    "solenoid": false,
+    "rfid_tag": "A1B2C3D4E5FF"
+  }
+  ```
+- `boseh/ready`
+  - Format:
+  ```json
+  {
+    "bike_id": "..."
+  }
+  ```
+  Catatan: fungsi publish ready tersedia di kode, tetapi belum dipanggil di alur utama saat ini.
+
+### 4.3 Format Payload Subscribe
+
+1. Topic `boseh/device/{slot}/control`
 ```json
-{"slot_number": 8, "rfid_tag": "00000008"}
+{
+  "slot_number": 1,
+  "command": "solenoid",
+  "value": true
+}
 ```
-Dipakai untuk mengisi `bike_id` agar bisa dikirim ke `boseh/ready`.
 
-### Subscribe Kontrol Solenoid
-- Topic: `boseh/device/<slot>/control`
-- Contoh payload:
+2. Topic `boseh/{slot}`
 ```json
-{"slot_number": 2, "command": "solenoid", "value": true}
-```
-Jika `slot_number` cocok, maka LED aksi (`GPIO2`) diubah ON/OFF.
-
-### Subscribe Request Maintenance
-- Topic: `boseh/<slot>`
-- Contoh payload:
-```json
-{"status": true}
-```
-Jika `status` bernilai `true`, perangkat akan publish status maintenance.
-
-### Publish `boseh/ready`
-- Trigger: tombol ditekan dalam window validasi slot 60 detik.
-- Payload:
-```json
-{"bike_id":"<rfid_tag dari boseh/status>"}
+{
+  "status": true
+}
 ```
 
-### Publish `boseh/stasiun/confirm_open`
-- Trigger:
-  - `status=true` saat RFID masuk jangkauan.
-  - `status=false` saat RFID keluar jangkauan.
-- Payload:
-```json
-{"slot_number": 8, "rfid_tag": "00000008", "status": true}
-```
-`slot_number` diambil dari konfigurasi `Slot Number` di dashboard.
-`rfid_tag` diambil dari hasil baca kartu RFID serial.
+## 5. Alur Operasi Firmware
 
-### Publish `boseh/maintenance`
-- Trigger: menerima request `{"status": true}` dari topic `boseh/<slot>`.
-- Payload:
-```json
-{"slot_number":2,"ip_address":"10.58.115.187","status":true,"solenoid":false,"rfid_tag":"3D00F6A2EF86"}
-```
-`status` bernilai `true` hanya jika MQTT benar-benar terkoneksi.
-`solenoid` merepresentasikan LED aksi (`GPIO2`).
-`rfid_tag` diambil dari hasil baca kartu RFID serial terakhir.
+1. `setup()`:
+   - init serial, RFID serial, pin
+   - load config dari NVS
+   - konek WiFi (dengan fallback AP)
+   - start web server
+   - konek MQTT + subscribe topic
 
-## Mapping Pin
-- `GPIO16`: RX dari ID-12LA (D0)
-- `GPIO17`: Tag in Range
-- `GPIO4`: LED status
-- `GPIO23`: Tombol input
-- `GPIO15`: LED tombol (aktif LOW)
-- `GPIO2`: LED aksi (ON 10 detik saat tombol valid ditekan)
+2. `loop()`:
+   - layani HTTP client
+   - jika AP fallback aktif: loop utama RFID/MQTT berhenti sementara (return cepat)
+   - jika mode normal: jaga koneksi WiFi + MQTT
+   - baca status tag in range (`GPIO17`)
+   - baca frame RFID dari UART dan validasi checksum
+   - publish `confirm_open` saat event tertentu
+   - proses tombol fisik dan timer aksi 10 detik
 
-## Catatan Operasional
-- Pastikan broker MQTT menerima koneksi dari IP ESP32.
-- Format payload `boseh/status` harus memuat `slot_number` dan `rfid_tag`.
-- Jika tombol ditekan tapi aksi tidak jalan, cek:
-  - slot dari payload harus sama dengan `Slot Number` konfigurasi
-  - masih dalam timeout 60 detik
-  - wiring tombol ke pin yang benar (`GPIO23` saat ini)
+## 6. Trigger AP Fallback
+
+AP fallback aktif saat:
+- startup `setup()` gagal konek WiFi STA (`connectWiFi(true)`)
+- setelah simpan konfigurasi (`/save`) lalu reconnect gagal (`connectWiFi(true)`)
+
+Saat AP aktif, device tetap melayani dashboard web dan konfigurasi, tetapi logika utama pada `loop()` berhenti sementara sampai kondisi berubah.
+
+## 7. Dashboard Web
+
+### Endpoint utama
+
+- `GET /`:
+  - jika belum unlock -> halaman PIN
+  - jika sudah unlock -> dashboard konfigurasi
+- `POST /unlock`: verifikasi PIN
+- `POST /save`: simpan config WiFi/MQTT/slot/relay level, lalu reconnect
+- `POST /debug/pin`: baca/tulis mode dan level GPIO debug yang diizinkan
+- `POST /update`: upload firmware OTA dan reboot saat sukses
+
+### Mekanisme lock
+
+- Dashboard memakai lock sederhana berbasis PIN (`1221`)
+- Status unlock disimpan di RAM (`dashboardUnlocked`), bukan session token persisten
+
+## 8. Event `confirm_open` (Perilaku Saat Ini)
+
+Topic `boseh/stasiun/confirm_open` dipakai untuk beberapa event:
+- `status=true` saat kartu terbaca dalam range
+- `status=false` saat kartu keluar range
+- `status=false` saat tombol ditekan untuk aksi open
+
+Catatan integrasi backend: `status=false` memiliki lebih dari satu konteks event, jadi jika perlu pemisahan konteks sebaiknya tambah field event terpisah (mis. `event":"tag_out"` / `event":"button_open"`).
+
+## 9. Build Environment
+
+`platformio.ini`:
+- `platform = espressif32`
+- `board = esp32dev`
+- `framework = arduino`
+- `monitor_speed = 115200`
+- dependency: `knolleary/PubSubClient`
+
+## 10. Catatan Integrasi
+
+- Dokumen lama yang memakai topic `boseh/stasiun/update` tidak lagi sesuai dengan firmware ini.
+- Integrasi backend/distributor message harus mengikuti daftar topic pada bagian MQTT (bagian 4).
