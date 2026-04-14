@@ -25,11 +25,8 @@ const int   SLOT_NUMBER_DEFAULT = 1;
 const unsigned long ACTION_DURATION_MS_DEFAULT = 10000;
 const unsigned long BUTTON_WAIT_TIMEOUT_MS_DEFAULT = 30000;
 const char* DEVICE_ROLE_DEFAULT = "node";
-const char* NODE_COMM_MODE_DEFAULT = "mqtt";
 const char* GATEWAY_UPLINK_DEFAULT = "mqtt"; // mqtt | serial | both
 
-const char* MQTT_STATUS_TOPIC_BASE = "boseh/status";
-const char* MQTT_READY_TOPIC = "boseh/ready";
 const char* MQTT_CONFIRM_TOPIC = "boseh/stasiun/confirm_open";
 const char* MQTT_MAINT_TOPIC = "boseh/maintenance";
 
@@ -42,11 +39,7 @@ String wifiStaticIpConfig = "";
 String wifiGatewayConfig = "";
 String wifiSubnetConfig = "";
 String wifiDnsConfig = "";
-String mqttStatusTopic = "";
-String mqttControlTopic = "";
-String mqttStatusRequestTopic = "";
 String deviceRoleConfig = DEVICE_ROLE_DEFAULT;     // node | gateway
-String nodeCommModeConfig = NODE_COMM_MODE_DEFAULT; // mqtt | espnow
 String gatewayUplinkConfig = GATEWAY_UPLINK_DEFAULT;
 
 const char* AP_FALLBACK_SSID_BASE = "BOSEH-Config-";
@@ -118,6 +111,10 @@ struct SlotPeerState {
   uint8_t mac[6];
   unsigned long lastSeenMs;
   uint32_t lastInboundMsgId;
+  bool deferredActive;
+  bool deferredTrackAck;
+  unsigned long deferredQueuedMs;
+  EspNowPacket deferredPacket;
   bool pendingActive;
   uint32_t pendingMsgId;
   uint8_t pendingRetries;
@@ -148,6 +145,7 @@ uint8_t nodeMaxRetries = 3;
 
 const int MAX_SLOT_INDEX = 64;
 SlotPeerState slotPeers[MAX_SLOT_INDEX + 1];
+uint32_t gatewayPeerRejectCount = 0;
 
 bool espNowReady = false;
 bool gatewayMacValid = false;
@@ -157,6 +155,7 @@ uint32_t gatewayTxMsgId = 1;
 uint32_t nodeLastStatusArmMsgId = 0;
 uint32_t nodeLastControlMsgId = 0;
 unsigned long lastNodeHeartbeatMs = 0;
+unsigned long lastEspNowInitAttemptMs = 0;
 String gatewaySerialRxLine = "";
 
 String toLowerTrim(String input) {
@@ -167,10 +166,6 @@ String toLowerTrim(String input) {
 
 bool isGatewayRole() {
   return deviceRoleConfig == "gateway";
-}
-
-bool isNodeMqttMode() {
-  return nodeCommModeConfig == "mqtt";
 }
 
 bool gatewayUsesMqttUplink() {
@@ -186,6 +181,11 @@ String macToString(const uint8_t* mac) {
   snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return String(buf);
+}
+
+bool macEquals(const uint8_t* a, const uint8_t* b) {
+  if (!a || !b) return false;
+  return memcmp(a, b, 6) == 0;
 }
 
 bool parseMacAddress(const String& text, uint8_t outMac[6]) {
@@ -217,10 +217,6 @@ void printDeviceMacInfo() {
   Serial.println("MAC STA (Node/Gateway): " + staMac);
   Serial.println("MAC AP  (SoftAP)      : " + apMac);
   Serial.println("=======================");
-}
-
-bool isEspNowNodeMode() {
-  return !isGatewayRole() && nodeCommModeConfig == "espnow";
 }
 
 uint32_t nextNodeMsgId() {
@@ -348,6 +344,7 @@ void onEspNowSent(const uint8_t* mac, esp_now_send_status_t status) {
 
 bool initEspNowStack() {
   if (espNowReady) return true;
+  lastEspNowInitAttemptMs = millis();
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init gagal");
@@ -361,9 +358,15 @@ bool initEspNowStack() {
 }
 
 bool espNowSendPacket(const uint8_t* mac, const EspNowPacket& pkt) {
-  if (!espNowReady) return false;
+  if (!espNowReady) {
+    if (!initEspNowStack()) return false;
+  }
   if (!espNowEnsurePeer(mac)) return false;
   esp_err_t r = esp_now_send(mac, (const uint8_t*)&pkt, sizeof(EspNowPacket));
+  if (r == ESP_ERR_ESPNOW_NOT_INIT) {
+    espNowReady = false;
+    Serial.println("ESP-NOW belum init saat send, akan re-init");
+  }
   return r == ESP_OK;
 }
 
@@ -498,23 +501,6 @@ int clampApOctet(int slotNo) {
   if (slotNo < 2) return 2;
   if (slotNo > 254) return 254;
   return slotNo;
-}
-
-int parseSlotNumber(const String& msg) {
-  int idx = msg.indexOf("\"slot_number\"");
-  if (idx < 0) return -1;
-
-  idx = msg.indexOf(":", idx);
-  if (idx < 0) return -1;
-
-  idx++;
-  while (idx < (int)msg.length() && msg[idx] == ' ') idx++;
-
-  int end = idx;
-  while (end < (int)msg.length() && (msg[end] >= '0' && msg[end] <= '9')) end++;
-  if (end == idx) return -1;
-
-  return msg.substring(idx, end).toInt();
 }
 
 String parseJsonString(const String& msg, const char* key) {
@@ -682,18 +668,6 @@ bool extractValidTagFromRawHex(const String& rawHex, String* outTag) {
   return false;
 }
 
-void updateMqttControlTopic() {
-  mqttStatusTopic = MQTT_STATUS_TOPIC_BASE;
-  mqttStatusTopic += "/";
-  mqttStatusTopic += String(slotNumberConfig);
-
-  mqttControlTopic = "boseh/device/";
-  mqttControlTopic += String(slotNumberConfig);
-  mqttControlTopic += "/control";
-  mqttStatusRequestTopic = "boseh/";
-  mqttStatusRequestTopic += String(slotNumberConfig);
-}
-
 void loadConfig() {
   prefs.begin("cfg", true);
   wifiSsidConfig = prefs.getString("wifi_ssid", WIFI_SSID_DEFAULT);
@@ -706,7 +680,6 @@ void loadConfig() {
   wifiSubnetConfig = prefs.getString("sta_sn", "");
   wifiDnsConfig = prefs.getString("sta_dns", "");
   deviceRoleConfig = toLowerTrim(prefs.getString("dev_role", DEVICE_ROLE_DEFAULT));
-  nodeCommModeConfig = toLowerTrim(prefs.getString("node_mode", NODE_COMM_MODE_DEFAULT));
   gatewayUplinkConfig = toLowerTrim(prefs.getString("gw_uplink", GATEWAY_UPLINK_DEFAULT));
   gatewayMacConfig = toLowerTrim(prefs.getString("gw_mac", ""));
   actionDurationMs = prefs.getULong("act_ms", ACTION_DURATION_MS_DEFAULT);
@@ -717,12 +690,10 @@ void loadConfig() {
   prefs.end();
 
   if (deviceRoleConfig != "node" && deviceRoleConfig != "gateway") deviceRoleConfig = DEVICE_ROLE_DEFAULT;
-  if (nodeCommModeConfig != "mqtt" && nodeCommModeConfig != "espnow") nodeCommModeConfig = NODE_COMM_MODE_DEFAULT;
   if (gatewayUplinkConfig != "mqtt" && gatewayUplinkConfig != "serial" && gatewayUplinkConfig != "both") {
     gatewayUplinkConfig = GATEWAY_UPLINK_DEFAULT;
   }
   if (slotNumberConfig <= 0) slotNumberConfig = SLOT_NUMBER_DEFAULT;
-  updateMqttControlTopic();
 }
 
 int parseTrailingSlotFromTopic(const char* topic, const char* prefix) {
@@ -767,7 +738,6 @@ void saveConfig(
   const String& staSn,
   const String& staDns,
   const String& role,
-  const String& nodeMode,
   const String& gatewayUplink,
   const String& gatewayMac,
   unsigned long actionMs,
@@ -787,7 +757,6 @@ void saveConfig(
   prefs.putString("sta_sn", staSn);
   prefs.putString("sta_dns", staDns);
   prefs.putString("dev_role", role);
-  prefs.putString("node_mode", nodeMode);
   prefs.putString("gw_uplink", gatewayUplink);
   prefs.putString("gw_mac", gatewayMac);
   prefs.putULong("act_ms", actionMs);
@@ -918,22 +887,6 @@ void connectMQTT() {
         mqttClient.subscribe("boseh/device/+/control");
         mqttClient.subscribe("boseh/+");
         Serial.println("Subscribed gateway: boseh/status/+, boseh/device/+/control, boseh/+");
-      } else {
-        if (mqttStatusTopic.length() > 0) {
-          mqttClient.subscribe(mqttStatusTopic.c_str());
-          Serial.print("Subscribed to: ");
-          Serial.println(mqttStatusTopic);
-        }
-        if (mqttControlTopic.length() > 0) {
-          mqttClient.subscribe(mqttControlTopic.c_str());
-          Serial.print("Subscribed to: ");
-          Serial.println(mqttControlTopic);
-        }
-        if (mqttStatusRequestTopic.length() > 0) {
-          mqttClient.subscribe(mqttStatusRequestTopic.c_str());
-          Serial.print("Subscribed to: ");
-          Serial.println(mqttStatusRequestTopic);
-        }
       }
     } else {
       Serial.print(".");
@@ -946,35 +899,8 @@ void connectMQTT() {
   }
 }
 
-void publishReadyMessage(const String& bikeId) {
-  if (bikeId.length() == 0) {
-    Serial.println("bike_id kosong, publish dibatalkan");
-    return;
-  }
-
-  if (WiFi.status() != WL_CONNECTED) connectWiFi(false);
-  if (!mqttClient.connected()) connectMQTT();
-  mqttClient.loop();
-
-  if (!mqttClient.connected()) {
-    Serial.println("MQTT tidak terkoneksi, publish ready gagal");
-    return;
-  }
-
-  String payload = "{\"bike_id\":\"" + bikeId + "\"}";
-  bool ok = mqttClient.publish(MQTT_READY_TOPIC, payload.c_str());
-
-  Serial.print("Publish ");
-  Serial.print(MQTT_READY_TOPIC);
-  Serial.print(": ");
-  Serial.println(payload);
-  if (!ok) {
-    Serial.println("Publish ready gagal");
-  }
-}
-
 void publishConfirmOpen(const String& rfidTag, bool status) {
-  if (isEspNowNodeMode()) {
+  if (!isGatewayRole()) {
     if (!gatewayMacValid || !espNowReady) return;
     EspNowPacket pkt = {};
     pkt.version = ESPNOW_PROTO_VER;
@@ -1019,7 +945,7 @@ void publishConfirmOpen(const String& rfidTag, bool status) {
 }
 
 void publishMaintenanceStatus() {
-  if (isEspNowNodeMode()) {
+  if (!isGatewayRole()) {
     if (!gatewayMacValid || !espNowReady) return;
     EspNowPacket pkt = {};
     pkt.version = ESPNOW_PROTO_VER;
@@ -1084,6 +1010,8 @@ String htmlPage() {
   html += "<div class='card'><h2>Boseh Device Config</h2>";
   html += "<div class='row'><b>WiFi STA IP:</b> ";
   html += WiFi.localIP().toString();
+  html += "<br><b>MAC STA (Node/Gateway):</b> ";
+  html += WiFi.macAddress();
   html += "<br><b>AP IP:</b> ";
   html += WiFi.softAPIP().toString();
   html += "<br><b>MQTT Broker:</b> ";
@@ -1092,19 +1020,16 @@ String htmlPage() {
   html += (wifiUseStaticConfig ? "STATIC IP" : "DHCP");
   html += "<br><b>Device Role:</b> ";
   html += deviceRoleConfig;
-  html += "<br><b>Node Comm Mode:</b> ";
-  html += nodeCommModeConfig;
+  html += "<br><b>Node Comm Mode:</b> ESP-NOW (fixed)";
   html += "<br><b>Gateway Uplink:</b> ";
   html += gatewayUplinkConfig;
   html += "</div>";
   html += "<form method='POST' action='/save'>";
-  html += "<label>Device Role</label><select name='device_role'>";
+  html += "<label>Device Role</label><select id='device_role_select' name='device_role'>";
   html += (deviceRoleConfig == "gateway") ? "<option value='node'>NODE</option><option value='gateway' selected>GATEWAY</option>" : "<option value='node' selected>NODE</option><option value='gateway'>GATEWAY</option>";
   html += "</select>";
-  html += "<label>Node Comm Mode</label><select name='node_mode'>";
-  html += (nodeCommModeConfig == "espnow") ? "<option value='mqtt'>MQTT</option><option value='espnow' selected>ESP-NOW</option>" : "<option value='mqtt' selected>MQTT</option><option value='espnow'>ESP-NOW</option>";
-  html += "</select>";
-  html += "<label>Gateway Uplink (khusus role GATEWAY)</label><select name='gw_uplink'>";
+  html += "<div id='gateway_uplink_group'>";
+  html += "<label>Gateway Uplink</label><select id='gw_uplink_select' name='gw_uplink'>";
   if (gatewayUplinkConfig == "serial") {
     html += "<option value='mqtt'>MQTT</option><option value='serial' selected>SERIAL</option><option value='both'>BOTH</option>";
   } else if (gatewayUplinkConfig == "both") {
@@ -1113,8 +1038,10 @@ String htmlPage() {
     html += "<option value='mqtt' selected>MQTT</option><option value='serial'>SERIAL</option><option value='both'>BOTH</option>";
   }
   html += "</select>";
+  html += "<small>Gateway uplink menentukan jalur komunikasi Gateway ke PC/Backend.</small>";
+  html += "</div>";
   html += "<label>Gateway MAC (untuk NODE mode ESP-NOW)</label><input name='gw_mac' placeholder='contoh: 24:6F:28:AA:BB:CC' value='" + gatewayMacConfig + "'>";
-  html += "<small>Role GATEWAY akan menjalankan bridge ESP-NOW <-> MQTT. Saat role NODE, mode komunikasi mengikuti Node Comm Mode.</small>";
+  html += "<small>Role GATEWAY menjalankan bridge ESP-NOW dengan uplink sesuai pilihan. Role NODE selalu menggunakan ESP-NOW.</small>";
   html += "<label>WiFi SSID</label><input name='ssid' value='" + wifiSsidConfig + "' required>";
   html += "<label>WiFi Password</label><input name='password' type='password' value='" + wifiPasswordConfig + "'>";
   html += "<label>MQTT Broker IP</label><input name='mqtt' value='" + mqttServerConfig + "' required>";
@@ -1145,6 +1072,19 @@ String htmlPage() {
   html += "<button type='submit'>Upload OTA</button></form>";
   html += "<p><small>Setelah simpan config, device akan reconnect layanan sesuai role/uplink. OTA akan reboot saat sukses.</small></p>";
   html += "<a class='btn-link' href='/debug'>Buka Halaman Debug GPIO</a>";
+  html += "<script>";
+  html += "function syncRoleSections(){";
+  html += "var role=document.getElementById('device_role_select');";
+  html += "var gwGroup=document.getElementById('gateway_uplink_group');";
+  html += "if(!role||!gwGroup)return;";
+  html += "var isGateway=(role.value==='gateway');";
+  html += "gwGroup.style.display=isGateway?'block':'none';";
+  html += "}";
+  html += "document.addEventListener('DOMContentLoaded',function(){";
+  html += "var role=document.getElementById('device_role_select');";
+  html += "if(role){role.addEventListener('change',syncRoleSections);}syncRoleSections();";
+  html += "});";
+  html += "</script>";
   html += "</div></body></html>";
   return html;
 }
@@ -1233,7 +1173,6 @@ void handleSaveConfig() {
   String mqtt = server.arg("mqtt");
   int slot = server.arg("slot").toInt();
   String deviceRoleArg = toLowerTrim(server.arg("device_role"));
-  String nodeModeArg = toLowerTrim(server.arg("node_mode"));
   String gatewayUplinkArg = toLowerTrim(server.arg("gw_uplink"));
   String gatewayMacArg = toLowerTrim(server.arg("gw_mac"));
   String ipMode = server.arg("ip_mode");
@@ -1266,15 +1205,11 @@ void handleSaveConfig() {
     server.send(400, "text/plain", "device_role tidak valid");
     return;
   }
-  if (nodeModeArg != "mqtt" && nodeModeArg != "espnow") {
-    server.send(400, "text/plain", "node_mode tidak valid");
-    return;
-  }
   if (gatewayUplinkArg != "mqtt" && gatewayUplinkArg != "serial" && gatewayUplinkArg != "both") {
     server.send(400, "text/plain", "gw_uplink tidak valid");
     return;
   }
-  if (deviceRoleArg == "node" && nodeModeArg == "espnow") {
+  if (deviceRoleArg == "node") {
     uint8_t tmpMac[6];
     if (!parseMacAddress(gatewayMacArg, tmpMac)) {
       server.send(400, "text/plain", "Gateway MAC tidak valid");
@@ -1310,7 +1245,6 @@ void handleSaveConfig() {
   wifiSubnetConfig = staSn;
   wifiDnsConfig = staDns;
   deviceRoleConfig = deviceRoleArg;
-  nodeCommModeConfig = nodeModeArg;
   gatewayUplinkConfig = gatewayUplinkArg;
   gatewayMacConfig = gatewayMacArg;
   buttonWaitTimeoutMs = (unsigned long)waitSec * 1000UL;
@@ -1329,7 +1263,6 @@ void handleSaveConfig() {
     wifiSubnetConfig,
     wifiDnsConfig,
     deviceRoleConfig,
-    nodeCommModeConfig,
     gatewayUplinkConfig,
     gatewayMacConfig,
     actionDurationMs,
@@ -1338,7 +1271,6 @@ void handleSaveConfig() {
     relayPin2ActiveHigh,
     relayPin22ActiveHigh
   );
-  updateMqttControlTopic();
   setStatusLed(tagDetected);
   setActionLed(solenoidState);
   setMirrorLed(solenoidState);
@@ -1347,7 +1279,7 @@ void handleSaveConfig() {
   WiFi.disconnect(true);
   delay(300);
   connectWiFi(true);
-  if (!isGatewayRole() || gatewayUsesMqttUplink()) {
+  if (isGatewayRole() && gatewayUsesMqttUplink()) {
     connectMQTT();
   }
 
@@ -1546,15 +1478,64 @@ void gatewayClearPendingAck(uint8_t slotNo, uint32_t msgId) {
   }
 }
 
+void gatewayQueueDeferredPacket(uint8_t slotNo, const EspNowPacket& pkt, bool trackAck) {
+  int idx = safeSlotIndex(slotNo);
+  if (idx < 0) return;
+  slotPeers[idx].deferredActive = true;
+  slotPeers[idx].deferredTrackAck = trackAck;
+  slotPeers[idx].deferredQueuedMs = millis();
+  slotPeers[idx].deferredPacket = pkt;
+  Serial.print("Perintah slot ");
+  Serial.print(slotNo);
+  Serial.println(" di-queue menunggu peer online");
+}
+
+bool gatewayTryFlushDeferredPacket(uint8_t slotNo) {
+  int idx = safeSlotIndex(slotNo);
+  if (idx < 0) return false;
+  if (!slotPeers[idx].deferredActive) return false;
+  if (!slotPeers[idx].valid) return false;
+
+  EspNowPacket pkt = slotPeers[idx].deferredPacket;
+  bool trackAck = slotPeers[idx].deferredTrackAck;
+  bool sent = espNowSendPacket(slotPeers[idx].mac, pkt);
+  if (!sent) return false;
+
+  if (trackAck) {
+    slotPeers[idx].pendingActive = true;
+    slotPeers[idx].pendingMsgId = pkt.msgId;
+    slotPeers[idx].pendingRetries = 0;
+    slotPeers[idx].pendingSentMs = millis();
+    slotPeers[idx].pendingPacket = pkt;
+  }
+  slotPeers[idx].deferredActive = false;
+  Serial.print("Perintah tertunda slot ");
+  Serial.print(slotNo);
+  Serial.println(" berhasil dikirim");
+  return true;
+}
+
 bool gatewaySendPacketToSlot(uint8_t slotNo, EspNowPacket& pkt, bool trackAck) {
   int idx = safeSlotIndex(slotNo);
-  if (idx < 0 || !slotPeers[idx].valid) {
+  if (idx < 0) {
+    Serial.print("Slot tidak valid: ");
+    Serial.println(slotNo);
+    return false;
+  }
+  if (!slotPeers[idx].valid) {
     Serial.print("Peer slot tidak tersedia: ");
     Serial.println(slotNo);
+    gatewayQueueDeferredPacket(slotNo, pkt, trackAck);
     return false;
   }
 
   bool sent = espNowSendPacket(slotPeers[idx].mac, pkt);
+  if (!sent) {
+    Serial.print("Gagal kirim ESP-NOW ke slot ");
+    Serial.println(slotNo);
+    gatewayQueueDeferredPacket(slotNo, pkt, trackAck);
+    return false;
+  }
   if (sent && trackAck) {
     slotPeers[idx].pendingActive = true;
     slotPeers[idx].pendingMsgId = pkt.msgId;
@@ -1579,7 +1560,12 @@ void handleGatewayMqttMessage(const char* topic, const String& message) {
     pkt.msgId = nextGatewayMsgId();
     pkt.timestampMs = millis();
     rfidTag.toCharArray(pkt.rfidTag, sizeof(pkt.rfidTag));
-    gatewaySendPacketToSlot((uint8_t)slotFromStatus, pkt, true);
+    bool ok = gatewaySendPacketToSlot((uint8_t)slotFromStatus, pkt, true);
+    if (!ok) {
+      Serial.print("Status arm slot ");
+      Serial.print(slotFromStatus);
+      Serial.println(" belum terkirim (queued atau peer belum siap)");
+    }
     return;
   }
 
@@ -1598,7 +1584,12 @@ void handleGatewayMqttMessage(const char* topic, const String& message) {
     pkt.timestampMs = millis();
     pkt.value = value ? 1 : 0;
     command.toCharArray(pkt.command, sizeof(pkt.command));
-    gatewaySendPacketToSlot((uint8_t)slotFromControl, pkt, true);
+    bool ok = gatewaySendPacketToSlot((uint8_t)slotFromControl, pkt, true);
+    if (!ok) {
+      Serial.print("Control slot ");
+      Serial.print(slotFromControl);
+      Serial.println(" belum terkirim (queued atau peer belum siap)");
+    }
     return;
   }
 
@@ -1614,9 +1605,17 @@ void handleGatewayMqttMessage(const char* topic, const String& message) {
     pkt.status = 1;
     pkt.msgId = nextGatewayMsgId();
     pkt.timestampMs = millis();
-    gatewaySendPacketToSlot((uint8_t)slotFromMaintReq, pkt, true);
+    bool ok = gatewaySendPacketToSlot((uint8_t)slotFromMaintReq, pkt, true);
+    if (!ok) {
+      Serial.print("Maintenance req slot ");
+      Serial.print(slotFromMaintReq);
+      Serial.println(" belum terkirim (queued atau peer belum siap)");
+    }
     return;
   }
+
+  Serial.print("Topik MQTT tidak cocok routing gateway: ");
+  Serial.println(topic);
 }
 
 void handleNodeEspNowPacket(const uint8_t* srcMac, const EspNowPacket& pkt) {
@@ -1695,12 +1694,37 @@ void handleNodeEspNowPacket(const uint8_t* srcMac, const EspNowPacket& pkt) {
 }
 
 void handleGatewayEspNowPacket(const uint8_t* srcMac, const EspNowPacket& pkt) {
+  if (!srcMac) return;
   int idx = safeSlotIndex(pkt.slotNumber);
   if (idx < 0) return;
 
-  slotPeers[idx].valid = true;
-  memcpy(slotPeers[idx].mac, srcMac, 6);
+  if (!slotPeers[idx].valid) {
+    slotPeers[idx].valid = true;
+    memcpy(slotPeers[idx].mac, srcMac, 6);
+    Serial.print("Peer slot ");
+    Serial.print(idx);
+    Serial.print(" locked ke MAC ");
+    Serial.println(macToString(srcMac));
+  } else if (!macEquals(slotPeers[idx].mac, srcMac)) {
+    gatewayPeerRejectCount++;
+    static unsigned long lastRejectLogMs = 0;
+    unsigned long nowLog = millis();
+    if ((nowLog - lastRejectLogMs) > 1000) {
+      Serial.print("Reject packet slot ");
+      Serial.print(idx);
+      Serial.print(" dari MAC tidak dikenal: ");
+      Serial.print(macToString(srcMac));
+      Serial.print(" (expected ");
+      Serial.print(macToString(slotPeers[idx].mac));
+      Serial.print(") totalReject=");
+      Serial.println(gatewayPeerRejectCount);
+      lastRejectLogMs = nowLog;
+    }
+    return;
+  }
+
   slotPeers[idx].lastSeenMs = millis();
+  gatewayTryFlushDeferredPacket((uint8_t)idx);
 
   if (pkt.msgType == ESPNOW_MSG_ACK) {
     gatewayClearPendingAck(pkt.slotNumber, pkt.msgId);
@@ -1741,7 +1765,7 @@ void processEspNowQueue() {
   while (espNowQueuePop(&item)) {
     if (isGatewayRole()) {
       handleGatewayEspNowPacket(item.mac, item.pkt);
-    } else if (isEspNowNodeMode()) {
+    } else {
       handleNodeEspNowPacket(item.mac, item.pkt);
     }
   }
@@ -1750,6 +1774,10 @@ void processEspNowQueue() {
 void gatewayHandlePendingRetries() {
   unsigned long now = millis();
   for (int i = 1; i <= MAX_SLOT_INDEX; i++) {
+    if (slotPeers[i].deferredActive && slotPeers[i].valid) {
+      gatewayTryFlushDeferredPacket((uint8_t)i);
+    }
+
     if (!slotPeers[i].pendingActive) continue;
     if ((now - slotPeers[i].pendingSentMs) < 700) continue;
 
@@ -1768,6 +1796,8 @@ void gatewayHandlePendingRetries() {
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (!isGatewayRole()) return;
+
   String message;
   message.reserve(length);
   for (unsigned int i = 0; i < length; i++) {
@@ -1779,89 +1809,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.print("]: ");
   Serial.println(message);
 
-  if (isGatewayRole()) {
-    handleGatewayMqttMessage(topic, message);
-    return;
-  }
-
-  if (mqttStatusTopic.length() > 0 && strcmp(topic, mqttStatusTopic.c_str()) == 0) {
-    String rfidTag = parseJsonString(message, "rfid_tag");
-    if (rfidTag.length() == 0) {
-      Serial.println("rfid_tag tidak ditemukan");
-      if (buttonWaitActive && !actionActive) {
-        setMirrorLed(false);
-        solenoidState = false;
-      }
-      buttonWaitActive = false;
-      buttonWaitStartMs = 0;
-      currentBikeId = "";
-      lastStatusRfidTag = "";
-      return;
-    }
-
-    currentBikeId = rfidTag;
-    lastStatusRfidTag = rfidTag;
-    buttonWaitActive = true;
-    buttonWaitStartMs = millis();
-    setMirrorLed(true);
-    solenoidState = true;
-    Serial.print("status topic cocok: ");
-    Serial.println(mqttStatusTopic);
-    Serial.print("rfid_tag: ");
-    Serial.println(currentBikeId);
-    Serial.println("Status diterima: LED indikator pin22 ON, menunggu tombol");
-    return;
-  }
-
-  if (mqttControlTopic.length() > 0 && strcmp(topic, mqttControlTopic.c_str()) == 0) {
-    int slot = parseSlotNumber(message);
-    String command = parseJsonString(message, "command");
-    bool value = false;
-    bool hasValue = parseJsonBool(message, "value", &value);
-
-    if (slot != slotNumberConfig) {
-      Serial.println("slot_number tidak cocok, kontrol diabaikan");
-      return;
-    }
-    if (command != "solenoid" || !hasValue) {
-      Serial.println("command/value tidak valid");
-      return;
-    }
-
-    solenoidState = value;
-    setActionLed(solenoidState);
-    setMirrorLed(solenoidState);
-    if (solenoidState) {
-      actionActive = true;
-      actionStartMs = millis();
-    } else {
-      actionActive = false;
-    }
-    Serial.print("Solenoid set ke: ");
-    Serial.println(solenoidState ? "ON" : "OFF");
-    return;
-  }
-
-  if (mqttStatusRequestTopic.length() > 0 && strcmp(topic, mqttStatusRequestTopic.c_str()) == 0) {
-    bool status = false;
-    bool hasStatus = parseJsonBool(message, "status", &status);
-    if (!hasStatus) {
-      Serial.println("status tidak ditemukan, abaikan");
-      return;
-    }
-    if (status) {
-      publishMaintenanceStatus();
-    } else {
-      Serial.println("status=false, maintenance tidak dikirim");
-    }
-    return;
-  }
-}
-
-void runNodeMqttSetup() {
-  mqttClient.setCallback(mqttCallback);
-  connectMQTT();
-  Serial.println("Role NODE aktif, mode MQTT");
+  handleGatewayMqttMessage(topic, message);
 }
 
 void runNodeEspNowSetup() {
@@ -1891,6 +1839,7 @@ void runGatewayBridgeSetup() {
     connectMQTT();
   } else {
     mqttClient.disconnect();
+    Serial.println("Gateway uplink=serial, command dari MQTT tidak diproses");
   }
   if (!initEspNowStack()) {
     Serial.println("ESP-NOW gateway init gagal");
@@ -1900,132 +1849,12 @@ void runGatewayBridgeSetup() {
   Serial.println("Role GATEWAY aktif (bridge ESP-NOW <-> MQTT)");
 }
 
-void runNodeMqttLoop() {
-  if (WiFi.status() != WL_CONNECTED) connectWiFi(false);
-  if (!mqttClient.connected()) connectMQTT();
-  mqttClient.loop();
-
-  bool inRange = digitalRead(RANGE_PIN) == HIGH;
-
-  if (inRange && !tagDetected) {
-    tagDetected = true;
-    confirmOpenSentInCurrentRange = false;
-    Serial.println("TAG MASUK RANGE!");
-    Serial.println("Menunggu RFID terbaru untuk kirim confirm_open status=true");
-  }
-
-  if (RFIDSerial.available() > 0) {
-    String rawHex = "";
-    bool frameEnded = false;
-    unsigned long readStartMs = millis();
-
-    // Auto-refresh singkat: tunggu byte lanjutan agar frame tidak terpotong.
-    while ((millis() - readStartMs) < 30 && !frameEnded) {
-      while (RFIDSerial.available() > 0) {
-        char c = RFIDSerial.read();
-        if (c >= 'a' && c <= 'f') c = (char)(c - 32);
-
-        if (c == '\r' || c == '\n') {
-          frameEnded = true;
-          break;
-        }
-
-        if (isHexChar(c)) {
-          rawHex += c;
-        }
-      }
-      if (!frameEnded) delay(1);
-    }
-
-    String validatedTag = "";
-    if (extractValidTagFromRawHex(rawHex, &validatedTag)) {
-      tagID = validatedTag;
-      Serial.print("TAG TERBACA     : ");
-      Serial.println(tagID);
-      Serial.print("Scan Time       : ");
-      Serial.print(millis());
-      Serial.println(" ms");
-      Serial.println("-----------------------------------");
-      setStatusLed(true);
-      lastCardRfidTag = tagID;
-      if (inRange && !confirmOpenSentInCurrentRange) {
-        publishConfirmOpen(lastCardRfidTag, true);
-        confirmOpenSentInCurrentRange = true;
-      }
-    } else if (rawHex.length() > 0) {
-      Serial.print("Frame RFID tidak valid/kurang lengkap, retry: ");
-      Serial.println(rawHex);
-    }
-  }
-
-  if (!inRange && tagDetected) {
-    tagDetected = false;
-    confirmOpenSentInCurrentRange = false;
-    Serial.println("Tag keluar range\n");
-    setStatusLed(false);
-    if (lastCardRfidTag.length() > 0) {
-      publishConfirmOpen(lastCardRfidTag, false);
-    } else {
-      Serial.println("rfid_tag kosong (belum ada kartu terbaca), confirm_open tidak dikirim");
-    }
-  }
-
-  bool buttonPressed = (digitalRead(BUTTON_PIN) == LOW);
-  digitalWrite(LED_BUTTON, buttonPressed ? LOW : HIGH);
-
-  if (actionActive && (millis() - actionStartMs >= actionDurationMs)) {
-    actionActive = false;
-    setActionLed(false);
-    setMirrorLed(false);
-    solenoidState = false;
-    Serial.println("LED aksi OFF");
-  }
-
-  if (buttonWaitActive && !actionActive && (millis() - buttonWaitStartMs >= buttonWaitTimeoutMs)) {
-    buttonWaitActive = false;
-    buttonWaitStartMs = 0;
-    setMirrorLed(false);
-    solenoidState = false;
-    currentBikeId = "";
-    lastStatusRfidTag = "";
-    Serial.print("Timeout tunggu tombol (");
-    Serial.print(buttonWaitTimeoutMs / 1000);
-    Serial.println(" detik), kembali standby menunggu topic status");
-  }
-
-  if (buttonPressed && !lastButtonState) {
-    Serial.println("Tombol ditekan");
-  }
-
-  if (buttonWaitActive && !actionActive && buttonPressed && !lastButtonState) {
-    buttonWaitActive = false;
-    buttonWaitStartMs = 0;
-    actionActive = true;
-    actionStartMs = millis();
-    setActionLed(true);
-    setMirrorLed(true);
-    solenoidState = true;
-    String confirmTag = lastCardRfidTag;
-    if (confirmTag.length() == 0) {
-      confirmTag = currentBikeId;
-    }
-    if (confirmTag.length() > 0) {
-      publishConfirmOpen(confirmTag, false);
-    } else {
-      Serial.println("rfid_tag kosong, confirm_open tidak dikirim saat tombol ditekan");
-    }
-    Serial.print("Tombol ditekan: LED aksi ON ");
-    Serial.print(actionDurationMs / 1000);
-    Serial.println(" detik");
-    currentBikeId = "";
-  }
-
-  lastButtonState = buttonPressed;
-  delay(50);
-}
-
 void runNodeEspNowLoop() {
   if (WiFi.status() != WL_CONNECTED) connectWiFi(false);
+  unsigned long now = millis();
+  if (!espNowReady && (now - lastEspNowInitAttemptMs >= 2000)) {
+    initEspNowStack();
+  }
   processEspNowQueue();
   nodeKickReliableTx();
   nodeHandlePendingRetries();
@@ -2107,7 +1936,6 @@ void runNodeEspNowLoop() {
     currentBikeId = "";
   }
 
-  unsigned long now = millis();
   if (gatewayMacValid && espNowReady && (now - lastNodeHeartbeatMs >= 10000)) {
     EspNowPacket hb = {};
     hb.version = ESPNOW_PROTO_VER;
@@ -2129,6 +1957,10 @@ void runNodeEspNowLoop() {
 
 void runGatewayBridgeLoop() {
   if (WiFi.status() != WL_CONNECTED) connectWiFi(false);
+  unsigned long now = millis();
+  if (!espNowReady && (now - lastEspNowInitAttemptMs >= 2000)) {
+    initEspNowStack();
+  }
   if (gatewayUsesMqttUplink()) {
     if (!mqttClient.connected()) connectMQTT();
     mqttClient.loop();
@@ -2161,8 +1993,6 @@ void setup() {
 
   if (isGatewayRole()) {
     runGatewayBridgeSetup();
-  } else if (isNodeMqttMode()) {
-    runNodeMqttSetup();
   } else {
     runNodeEspNowSetup();
   }
@@ -2181,11 +2011,6 @@ void loop() {
 
   if (isGatewayRole()) {
     runGatewayBridgeLoop();
-    return;
-  }
-
-  if (isNodeMqttMode()) {
-    runNodeMqttLoop();
     return;
   }
 
