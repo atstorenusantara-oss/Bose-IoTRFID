@@ -175,6 +175,52 @@ bool gatewayUsesMqttUplink() {
 bool gatewayUsesSerialUplink() {
   return gatewayUplinkConfig == "serial" || gatewayUplinkConfig == "both";
 }
+
+const char* espNowMsgTypeLabel(uint8_t msgType) {
+  switch (msgType) {
+    case ESPNOW_MSG_STATUS_UPDATE: return "STATUS_UPDATE";
+    case ESPNOW_MSG_STATUS_ARM: return "STATUS_ARM";
+    case ESPNOW_MSG_CONTROL: return "CONTROL";
+    case ESPNOW_MSG_MAINT_REQ: return "MAINT_REQ";
+    case ESPNOW_MSG_MAINT_RESP: return "MAINT_RESP";
+    case ESPNOW_MSG_ACK: return "ACK";
+    case ESPNOW_MSG_HEARTBEAT: return "HEARTBEAT";
+    default: return "UNKNOWN";
+  }
+}
+
+void logNodeInboundPacket(const uint8_t* srcMac, const EspNowPacket& pkt) {
+  char macBuf[18] = "??:??:??:??:??:??";
+  if (srcMac) {
+    snprintf(macBuf, sizeof(macBuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+             srcMac[0], srcMac[1], srcMac[2], srcMac[3], srcMac[4], srcMac[5]);
+  }
+  Serial.print("Node RX from ");
+  Serial.print(macBuf);
+  Serial.print(" type=");
+  Serial.print(espNowMsgTypeLabel(pkt.msgType));
+  Serial.print(" msgId=");
+  Serial.print(pkt.msgId);
+  Serial.print(" slot=");
+  Serial.print(pkt.slotNumber);
+
+  if (pkt.msgType == ESPNOW_MSG_STATUS_ARM || pkt.msgType == ESPNOW_MSG_MAINT_REQ) {
+    Serial.print(" status=");
+    Serial.print(pkt.status);
+  }
+  if (pkt.msgType == ESPNOW_MSG_STATUS_ARM || pkt.msgType == ESPNOW_MSG_STATUS_UPDATE || pkt.msgType == ESPNOW_MSG_MAINT_RESP) {
+    Serial.print(" rfid=");
+    Serial.print(String(pkt.rfidTag));
+  }
+  if (pkt.msgType == ESPNOW_MSG_CONTROL) {
+    Serial.print(" command=");
+    Serial.print(String(pkt.command));
+    Serial.print(" value=");
+    Serial.print(pkt.value);
+  }
+  Serial.println();
+}
+
 String macToString(const uint8_t* mac) {
   if (!mac) return "";
   char buf[18];
@@ -1621,6 +1667,7 @@ void handleGatewayMqttMessage(const char* topic, const String& message) {
 void handleNodeEspNowPacket(const uint8_t* srcMac, const EspNowPacket& pkt) {
   if (gatewayMacValid && srcMac && memcmp(srcMac, gatewayMacBytes, 6) != 0) return;
   if (pkt.slotNumber != (uint8_t)slotNumberConfig) return;
+  logNodeInboundPacket(srcMac, pkt);
 
   if (pkt.msgType == ESPNOW_MSG_ACK) {
     if (nodePending.active && pkt.msgId == nodePending.msgId) {
