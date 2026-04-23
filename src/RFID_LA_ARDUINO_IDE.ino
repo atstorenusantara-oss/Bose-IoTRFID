@@ -38,6 +38,12 @@ const uint16_t MODBUS_EVENT_RFID_VALID = 4;
 const uint16_t MODBUS_EVENT_BUTTON_PRESS = 6;
 const uint16_t MODBUS_EVENT_SOLENOID_ON = 7;
 const uint16_t MODBUS_EVENT_SOLENOID_OFF = 8;
+const uint16_t MODBUS_FAULT_CFG_INVALID_RANGE = 1;
+const uint16_t MODBUS_FAULT_CFG_LOCKED = 2;
+const uint16_t MODBUS_BAUD_ENUM_DEFAULT = 0;
+const uint16_t MODBUS_PARITY_DEFAULT = 0;
+const uint16_t MODBUS_STOP_BITS_DEFAULT = 1;
+const uint16_t MODBUS_UNLOCK_TIMEOUT_DEFAULT = 30;
 
 String wifiSsidConfig = WIFI_SSID_DEFAULT;
 String wifiPasswordConfig = WIFI_PASSWORD_DEFAULT;
@@ -86,6 +92,13 @@ bool dashboardUnlocked = false;
 unsigned long actionDurationMs = ACTION_DURATION_MS_DEFAULT;
 unsigned long buttonWaitTimeoutMs = BUTTON_WAIT_TIMEOUT_MS_DEFAULT;
 String gatewayMacConfig = "";
+uint16_t modbusSlaveIdConfig = MODBUS_SLAVE_ID_DEFAULT;
+uint16_t modbusBaudEnumConfig = MODBUS_BAUD_ENUM_DEFAULT;
+uint16_t modbusParityConfig = MODBUS_PARITY_DEFAULT;
+uint16_t modbusStopBitsConfig = MODBUS_STOP_BITS_DEFAULT;
+uint16_t modbusUnlockTimeoutSecConfig = MODBUS_UNLOCK_TIMEOUT_DEFAULT;
+bool localButtonEnableConfig = true;
+uint16_t localButtonPriorityConfig = 0;
 
 const uint8_t ESPNOW_PROTO_VER = 1;
 const uint8_t ESPNOW_MSG_STATUS_UPDATE = 1; // node -> gateway (confirm/status)
@@ -176,6 +189,22 @@ void setModbusEventCode(uint16_t code) {
 }
 
 void publishModbusSnapshot() {
+  ModbusHandler::ConfigState cfg = {};
+  ModbusHandler::getConfigState(&cfg);
+  slotNumberConfig = (int)cfg.slotNumber;
+  actionDurationMs = cfg.actionMs;
+  buttonWaitTimeoutMs = cfg.waitMs;
+  relayPin4ActiveHigh = cfg.relay4ActiveHigh;
+  relayPin2ActiveHigh = cfg.relay2ActiveHigh;
+  relayPin22ActiveHigh = cfg.relay22ActiveHigh;
+  modbusSlaveIdConfig = cfg.slaveId;
+  modbusBaudEnumConfig = cfg.baudEnum;
+  modbusParityConfig = cfg.parity;
+  modbusStopBitsConfig = cfg.stopBits;
+  modbusUnlockTimeoutSecConfig = cfg.unlockTimeoutSec;
+  localButtonEnableConfig = cfg.localButtonEnable;
+  localButtonPriorityConfig = cfg.localButtonPriority;
+
   ModbusHandler::updateBasicStatus((uint16_t)slotNumberConfig, millis());
 
   bool tagInRange = digitalRead(RANGE_PIN) == HIGH;
@@ -194,9 +223,9 @@ void publishModbusSnapshot() {
     buttonPressed,
     solenoidState,
     actionActive,
-    false,
+    ModbusHandler::isConfigDirty(),
     modbusFaultActive,
-    false,
+    ModbusHandler::isUnlockValid(),
     rfidValid,
     lastCardRfidTag,
     modbusLastEventCode,
@@ -209,6 +238,34 @@ void publishModbusSnapshot() {
 void processModbusCommands() {
   ModbusHandler::CommandState cmd = {};
   if (!ModbusHandler::consumeCommands(&cmd)) return;
+
+  if (cmd.configWriteLockedFault) {
+    modbusFaultActive = true;
+    modbusFaultCode = MODBUS_FAULT_CFG_LOCKED;
+    Serial.println("Modbus config write ditolak: unlock belum valid");
+  }
+
+  if (cmd.configInvalidRangeFault) {
+    modbusFaultActive = true;
+    modbusFaultCode = MODBUS_FAULT_CFG_INVALID_RANGE;
+    Serial.println("Modbus config write ditolak: nilai di luar range");
+  }
+
+  ModbusHandler::ConfigState cfg = {};
+  ModbusHandler::getConfigState(&cfg);
+  slotNumberConfig = (int)cfg.slotNumber;
+  actionDurationMs = cfg.actionMs;
+  buttonWaitTimeoutMs = cfg.waitMs;
+  relayPin4ActiveHigh = cfg.relay4ActiveHigh;
+  relayPin2ActiveHigh = cfg.relay2ActiveHigh;
+  relayPin22ActiveHigh = cfg.relay22ActiveHigh;
+  modbusSlaveIdConfig = cfg.slaveId;
+  modbusBaudEnumConfig = cfg.baudEnum;
+  modbusParityConfig = cfg.parity;
+  modbusStopBitsConfig = cfg.stopBits;
+  modbusUnlockTimeoutSecConfig = cfg.unlockTimeoutSec;
+  localButtonEnableConfig = cfg.localButtonEnable;
+  localButtonPriorityConfig = cfg.localButtonPriority;
 
   if (cmd.hasSolenoidCommand) {
     solenoidState = cmd.solenoidValue;
@@ -228,6 +285,39 @@ void processModbusCommands() {
     modbusFaultActive = false;
     modbusFaultCode = 0;
     Serial.println("Modbus CMD: reset fault");
+  }
+
+  if (cmd.saveConfigPulse) {
+    saveConfig(
+      wifiSsidConfig,
+      wifiPasswordConfig,
+      mqttServerConfig,
+      slotNumberConfig,
+      wifiUseStaticConfig,
+      wifiStaticIpConfig,
+      wifiGatewayConfig,
+      wifiSubnetConfig,
+      wifiDnsConfig,
+      deviceRoleConfig,
+      gatewayUplinkConfig,
+      gatewayMacConfig,
+      actionDurationMs,
+      buttonWaitTimeoutMs,
+      relayPin4ActiveHigh,
+      relayPin2ActiveHigh,
+      relayPin22ActiveHigh
+    );
+    saveModbusPrefsOnly(
+      modbusSlaveIdConfig,
+      modbusBaudEnumConfig,
+      modbusParityConfig,
+      modbusStopBitsConfig,
+      modbusUnlockTimeoutSecConfig,
+      localButtonEnableConfig,
+      localButtonPriorityConfig
+    );
+    ModbusHandler::markConfigSaved();
+    Serial.println("Modbus CMD: save config ke Preferences");
   }
 
   if (cmd.clearRfidPulse) {
@@ -821,6 +911,13 @@ void loadConfig() {
   relayPin4ActiveHigh = prefs.getBool("r4_act_hi", true);
   relayPin2ActiveHigh = prefs.getBool("r2_act_hi", true);
   relayPin22ActiveHigh = prefs.getBool("r22_act_hi", false);
+  modbusSlaveIdConfig = (uint16_t)prefs.getUShort("mb_sid", MODBUS_SLAVE_ID_DEFAULT);
+  modbusBaudEnumConfig = (uint16_t)prefs.getUShort("mb_baud", MODBUS_BAUD_ENUM_DEFAULT);
+  modbusParityConfig = (uint16_t)prefs.getUShort("mb_par", MODBUS_PARITY_DEFAULT);
+  modbusStopBitsConfig = (uint16_t)prefs.getUShort("mb_stop", MODBUS_STOP_BITS_DEFAULT);
+  modbusUnlockTimeoutSecConfig = (uint16_t)prefs.getUShort("mb_ulto", MODBUS_UNLOCK_TIMEOUT_DEFAULT);
+  localButtonEnableConfig = prefs.getBool("mb_lbtn_en", true);
+  localButtonPriorityConfig = (uint16_t)prefs.getUShort("mb_lbtn_pr", 0);
   prefs.end();
 
   if (deviceRoleConfig != "node" && deviceRoleConfig != "gateway") deviceRoleConfig = DEVICE_ROLE_DEFAULT;
@@ -828,6 +925,12 @@ void loadConfig() {
     gatewayUplinkConfig = GATEWAY_UPLINK_DEFAULT;
   }
   if (slotNumberConfig <= 0) slotNumberConfig = SLOT_NUMBER_DEFAULT;
+  if (modbusSlaveIdConfig == 0 || modbusSlaveIdConfig > 247) modbusSlaveIdConfig = MODBUS_SLAVE_ID_DEFAULT;
+  if (modbusBaudEnumConfig > 4) modbusBaudEnumConfig = MODBUS_BAUD_ENUM_DEFAULT;
+  if (modbusParityConfig > 2) modbusParityConfig = MODBUS_PARITY_DEFAULT;
+  if (modbusStopBitsConfig != 1 && modbusStopBitsConfig != 2) modbusStopBitsConfig = MODBUS_STOP_BITS_DEFAULT;
+  if (modbusUnlockTimeoutSecConfig < 5 || modbusUnlockTimeoutSecConfig > 300) modbusUnlockTimeoutSecConfig = MODBUS_UNLOCK_TIMEOUT_DEFAULT;
+  if (localButtonPriorityConfig > 1) localButtonPriorityConfig = 0;
 }
 
 int parseTrailingSlotFromTopic(const char* topic, const char* prefix) {
@@ -898,6 +1001,26 @@ void saveConfig(
   prefs.putBool("r4_act_hi", pin4ActiveHigh);
   prefs.putBool("r2_act_hi", pin2ActiveHigh);
   prefs.putBool("r22_act_hi", pin22ActiveHigh);
+  prefs.end();
+}
+
+void saveModbusPrefsOnly(
+  uint16_t slaveId,
+  uint16_t baudEnum,
+  uint16_t parity,
+  uint16_t stopBits,
+  uint16_t unlockTimeoutSec,
+  bool localButtonEnable,
+  uint16_t localButtonPriority
+) {
+  prefs.begin("cfg", false);
+  prefs.putUShort("mb_sid", slaveId);
+  prefs.putUShort("mb_baud", baudEnum);
+  prefs.putUShort("mb_par", parity);
+  prefs.putUShort("mb_stop", stopBits);
+  prefs.putUShort("mb_ulto", unlockTimeoutSec);
+  prefs.putBool("mb_lbtn_en", localButtonEnable);
+  prefs.putUShort("mb_lbtn_pr", localButtonPriority);
   prefs.end();
 }
 
@@ -2046,7 +2169,7 @@ void runNodeEspNowLoop() {
     }
   }
 
-  bool buttonPressed = (digitalRead(BUTTON_PIN) == LOW);
+  bool buttonPressed = localButtonEnableConfig && (digitalRead(BUTTON_PIN) == LOW);
   digitalWrite(LED_BUTTON, buttonPressed ? LOW : HIGH);
 
   if (actionActive && (millis() - actionStartMs >= actionDurationMs)) {
@@ -2142,7 +2265,22 @@ void setup() {
     runNodeEspNowSetup();
   }
 
-  bool modbusReady = ModbusHandler::begin(MODBUS_SLAVE_ID_DEFAULT, (uint16_t)slotNumberConfig);
+  ModbusHandler::ConfigState modbusCfg = {};
+  modbusCfg.slotNumber = (uint16_t)slotNumberConfig;
+  modbusCfg.actionMs = actionDurationMs;
+  modbusCfg.waitMs = buttonWaitTimeoutMs;
+  modbusCfg.relay4ActiveHigh = relayPin4ActiveHigh;
+  modbusCfg.relay2ActiveHigh = relayPin2ActiveHigh;
+  modbusCfg.relay22ActiveHigh = relayPin22ActiveHigh;
+  modbusCfg.slaveId = modbusSlaveIdConfig;
+  modbusCfg.baudEnum = modbusBaudEnumConfig;
+  modbusCfg.parity = modbusParityConfig;
+  modbusCfg.stopBits = modbusStopBitsConfig;
+  modbusCfg.applySerialNow = 0;
+  modbusCfg.localButtonEnable = localButtonEnableConfig;
+  modbusCfg.localButtonPriority = localButtonPriorityConfig;
+  modbusCfg.unlockTimeoutSec = modbusUnlockTimeoutSecConfig;
+  bool modbusReady = ModbusHandler::begin((uint8_t)modbusSlaveIdConfig, modbusCfg);
   modbusLastEventCode = MODBUS_EVENT_BOOT;
   Serial.println(modbusReady ? "Modbus RTU siap (Commit A bootstrap)" : "Modbus RTU gagal init");
 

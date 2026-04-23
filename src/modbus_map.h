@@ -36,6 +36,26 @@ constexpr uint16_t IREG_STS_FW_VERSION_MAJOR = 13;
 constexpr uint16_t IREG_STS_FW_VERSION_MINOR = 14;
 constexpr uint16_t IREG_STS_FW_VERSION_PATCH = 15;
 
+constexpr uint16_t HREG_CFG_SLOT_NUMBER = 0;
+constexpr uint16_t HREG_CFG_ACTION_MS_LO = 1;
+constexpr uint16_t HREG_CFG_ACTION_MS_HI = 2;
+constexpr uint16_t HREG_CFG_WAIT_MS_LO = 3;
+constexpr uint16_t HREG_CFG_WAIT_MS_HI = 4;
+constexpr uint16_t HREG_CFG_R4_ACTIVE_HIGH = 5;
+constexpr uint16_t HREG_CFG_R2_ACTIVE_HIGH = 6;
+constexpr uint16_t HREG_CFG_R22_ACTIVE_HIGH = 7;
+constexpr uint16_t HREG_CFG_MODBUS_SLAVE_ID = 8;
+constexpr uint16_t HREG_CFG_MODBUS_BAUD_ENUM = 9;
+constexpr uint16_t HREG_CFG_MODBUS_PARITY = 10;
+constexpr uint16_t HREG_CFG_MODBUS_STOP_BITS = 11;
+constexpr uint16_t HREG_CFG_APPLY_SERIAL_NOW = 12;
+constexpr uint16_t HREG_CFG_LOCAL_BUTTON_ENABLE = 13;
+constexpr uint16_t HREG_CFG_LOCAL_BUTTON_PRIORITY = 14;
+constexpr uint16_t HREG_CFG_WRITE_UNLOCK_KEY = 30;
+constexpr uint16_t HREG_CFG_UNLOCK_TIMEOUT_SEC = 31;
+
+constexpr uint16_t CFG_UNLOCK_MAGIC = 0x5A5A;
+
 struct BasicSnapshot {
   uint16_t slotNumber;
   uint32_t uptimeMs;
