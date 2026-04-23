@@ -1,135 +1,139 @@
 # Dokumentasi Parser Serial Gateway
 
-Dokumen ini menjelaskan format komunikasi serial antara PC dan gateway ESP32 pada mode uplink `serial` atau `both`.
+Dokumen ini mendefinisikan protokol serial antara aplikasi desktop dan gateway ESP32 pada mode uplink `serial` atau `both`.
 
 ## Ringkasan
 
-- Transport: UART `Serial` (USB CDC).
-- Framing: **1 JSON object per baris** (diakhiri `\n`).
-- Gateway membaca per karakter, mengabaikan `\r`, dan memproses saat `\n`.
-- Panjang buffer baris masuk dibatasi ~400 karakter.
+- Transport: UART `Serial` (USB CDC), `115200 8N1`.
+- Framing: **1 JSON object per baris**, wajib diakhiri `\n`.
+- Gateway membaca per karakter, mengabaikan `\r`, memproses saat `\n`.
+- Batas panjang baris input ke gateway sekitar 400 karakter.
 
-## Konfigurasi
+## Konfigurasi Perangkat
 
-Di dashboard web:
+Set di dashboard web gateway:
 
-- `Device Role` = `gateway`
-- `Gateway Uplink`:
-  - `mqtt` = hanya MQTT
-  - `serial` = hanya serial
-  - `both` = MQTT + serial
+- `Device Role = gateway`
+- `Gateway Uplink = serial` atau `both`
 
-## Format Pesan Masuk (PC -> Gateway)
+Jika `Gateway Uplink = mqtt`, jalur serial untuk command desktop tidak dipakai.
 
-Format umum:
+## Kontrak Data Serial
+
+Semua arah komunikasi memakai envelope yang sama:
 
 ```json
 {"topic":"<topic>","payload":{...}}
 ```
 
-Field wajib:
+Aturan:
 
-- `topic` (string)
-- `payload` (JSON object)
+- `topic` wajib string.
+- `payload` wajib object JSON (`{}`), bukan string/array.
+- JSON harus valid dan selesai dalam satu baris.
 
-Jika format tidak valid, gateway log:
+Jika invalid, gateway menulis log:
 
 ```text
 Serial command invalid
 ```
 
-## Topik yang Didukung (Masuk)
+## Pesan Masuk (Desktop -> Gateway)
 
-Parser serial memakai handler yang sama dengan MQTT gateway, jadi topik yang didukung sama:
+### 1) Arm status ke node
 
-1. Status arm ke node
+Topic: `boseh/status/{slot}`
 
 ```json
 {"topic":"boseh/status/12","payload":{"rfid_tag":"A1B2C3D4E5F6"}}
 ```
 
-2. Control solenoid ke node
+### 2) Control solenoid ke node
+
+Topic: `boseh/device/{slot}/control`
 
 ```json
 {"topic":"boseh/device/12/control","payload":{"command":"solenoid","value":true}}
 ```
 
-3. Maintenance request ke node
+### 3) Maintenance request ke node
+
+Topic: `boseh/{slot}`
 
 ```json
 {"topic":"boseh/12","payload":{"status":true}}
 ```
 
-## Format Pesan Keluar (Gateway -> PC)
+## Pesan Keluar (Gateway -> Desktop)
 
-Semua event keluar via serial memakai format:
+### 1) Confirm open dari node
+
+Topic: `boseh/stasiun/confirm_open`
 
 ```json
-{"topic":"<topic>","payload":{...}}
+{"topic":"boseh/stasiun/confirm_open","payload":{"slot_number":12,"rfid_tag":"A1B2C3D4E5F6","status":true}}
 ```
 
-Event yang dikirim:
+Keterangan payload:
 
-1. Confirm open
+- `slot_number` (number): ID slot node.
+- `rfid_tag` (string): RFID yang terbaca.
+- `status` (bool): status event dari node.
 
-Topic:
+### 2) Maintenance status dari node
+
+Topic: `boseh/maintenance`
+
+```json
+{"topic":"boseh/maintenance","payload":{"slot_number":12,"ip_address":"192.168.1.20","status":true,"solenoid":false,"rfid_tag":"A1B2C3D4E5F6"}}
+```
+
+Keterangan payload:
+
+- `slot_number` (number): ID slot node.
+- `ip_address` (string): IP gateway saat publish event.
+- `status` (bool): status node dari paket maintenance.
+- `solenoid` (bool): status output solenoid node.
+- `rfid_tag` (string): RFID terakhir yang diketahui node.
+
+## Contoh Stream Serial untuk Aplikasi Desktop
+
+Contoh tulis dari desktop (TX):
 
 ```text
-boseh/stasiun/confirm_open
+{"topic":"boseh/device/1/control","payload":{"command":"solenoid","value":true}}\n
+{"topic":"boseh/1","payload":{"status":true}}\n
 ```
 
-Contoh payload:
-
-```json
-{"slot_number":12,"rfid_tag":"A1B2C3D4E5F6","status":true}
-```
-
-2. Maintenance status
-
-Topic:
+Contoh baca di desktop (RX):
 
 ```text
-boseh/maintenance
+{"topic":"boseh/stasiun/confirm_open","payload":{"slot_number":1,"rfid_tag":"A1B2C3D4E5F6","status":true}}
+{"topic":"boseh/maintenance","payload":{"slot_number":1,"ip_address":"192.168.1.20","status":true,"solenoid":false,"rfid_tag":"A1B2C3D4E5F6"}}
 ```
 
-Contoh payload:
+## Rekomendasi Implementasi Desktop
 
-```json
-{"slot_number":12,"ip_address":"192.168.1.20","status":true,"solenoid":false,"rfid_tag":"A1B2C3D4E5F6"}
-```
-
-## Catatan Perilaku Parser
-
-- Parser `payload` mengharuskan object (`{...}`), bukan string/array.
-- Spasi/tab setelah `:` diperbolehkan.
-- Nested object di `payload` didukung selama JSON seimbang.
-- Escape string dasar didukung saat scanning object.
-- Jika baris terlalu panjang, karakter setelah batas buffer diabaikan sampai `\n`.
-
-## Contoh Alur Uji Cepat
-
-Kirim dari PC ke serial monitor gateway:
-
-```json
-{"topic":"boseh/device/1/control","payload":{"command":"solenoid","value":true}}
-```
-
-Jika valid dan slot peer tersedia, gateway akan meneruskan ke node lewat ESP-NOW.
+- Baca serial sebagai stream teks dan buffer sampai `\n`.
+- Abaikan `\r`, parse tiap baris sebagai JSON object.
+- Validasi field `topic` dan `payload` sebelum diproses.
+- Routing berdasarkan `topic` saja, isi detail ambil dari `payload`.
+- Saat mengirim command, selalu tambahkan newline di akhir.
 
 ## Troubleshooting
 
 1. Tidak ada respons serial:
-- Pastikan `Device Role = gateway`.
-- Pastikan `Gateway Uplink = serial` atau `both`.
-- Pastikan baud monitor sama (`115200`).
+- Pastikan role device adalah gateway.
+- Pastikan uplink `serial` atau `both`.
+- Pastikan baud desktop `115200`.
 
 2. Muncul `Serial command invalid`:
-- Cek JSON valid.
-- Cek ada `topic` string.
-- Cek `payload` adalah object.
-- Cek pesan diakhiri newline (`\n`).
+- Pastikan JSON valid.
+- Pastikan ada `topic` string.
+- Pastikan `payload` object.
+- Pastikan command diakhiri `\n`.
 
-3. Command tidak sampai node:
-- Cek slot sudah pernah heartbeat/terdaftar peer.
-- Cek jarak/rf link ESP-NOW.
-- Cek log `Peer slot tidak tersedia`.
+3. Command diterima tapi node tidak aksi:
+- Cek slot node sudah online/terdaftar peer.
+- Cek sinyal/range ESP-NOW.
+- Cek log gateway: `Peer slot tidak tersedia`.
