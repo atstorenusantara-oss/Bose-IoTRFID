@@ -31,6 +31,13 @@ const char* GATEWAY_UPLINK_DEFAULT = "mqtt"; // mqtt | serial | both
 const char* MQTT_CONFIRM_TOPIC = "boseh/stasiun/confirm_open";
 const char* MQTT_MAINT_TOPIC = "boseh/maintenance";
 const uint8_t MODBUS_SLAVE_ID_DEFAULT = 1;
+const uint16_t MODBUS_EVENT_BOOT = 1;
+const uint16_t MODBUS_EVENT_TAG_ENTER = 2;
+const uint16_t MODBUS_EVENT_TAG_LEAVE = 3;
+const uint16_t MODBUS_EVENT_RFID_VALID = 4;
+const uint16_t MODBUS_EVENT_BUTTON_PRESS = 6;
+const uint16_t MODBUS_EVENT_SOLENOID_ON = 7;
+const uint16_t MODBUS_EVENT_SOLENOID_OFF = 8;
 
 String wifiSsidConfig = WIFI_SSID_DEFAULT;
 String wifiPasswordConfig = WIFI_PASSWORD_DEFAULT;
@@ -159,6 +166,43 @@ uint32_t nodeLastControlMsgId = 0;
 unsigned long lastNodeHeartbeatMs = 0;
 unsigned long lastEspNowInitAttemptMs = 0;
 String gatewaySerialRxLine = "";
+uint16_t modbusLastEventCode = MODBUS_EVENT_BOOT;
+
+void setModbusEventCode(uint16_t code) {
+  if (code == 0) return;
+  modbusLastEventCode = code;
+}
+
+void publishModbusSnapshot() {
+  ModbusHandler::updateBasicStatus((uint16_t)slotNumberConfig, millis());
+
+  bool tagInRange = digitalRead(RANGE_PIN) == HIGH;
+  bool buttonPressed = digitalRead(BUTTON_PIN) == LOW;
+  uint32_t actionRemainMs = 0;
+  if (actionActive) {
+    unsigned long elapsed = millis() - actionStartMs;
+    if (elapsed < actionDurationMs) {
+      actionRemainMs = actionDurationMs - elapsed;
+    }
+  }
+
+  bool rfidValid = lastCardRfidTag.length() > 0;
+  ModbusHandler::updateRuntimeStatus(
+    tagInRange,
+    buttonPressed,
+    solenoidState,
+    actionActive,
+    false,
+    false,
+    false,
+    rfidValid,
+    lastCardRfidTag,
+    modbusLastEventCode,
+    0,
+    actionRemainMs
+  );
+  ModbusHandler::task();
+}
 
 String toLowerTrim(String input) {
   input.trim();
@@ -1698,6 +1742,7 @@ void handleNodeEspNowPacket(const uint8_t* srcMac, const EspNowPacket& pkt) {
       buttonWaitStartMs = 0;
       currentBikeId = "";
       lastStatusRfidTag = "";
+      setModbusEventCode(MODBUS_EVENT_SOLENOID_OFF);
       return;
     }
 
@@ -1707,6 +1752,7 @@ void handleNodeEspNowPacket(const uint8_t* srcMac, const EspNowPacket& pkt) {
     buttonWaitStartMs = millis();
     setMirrorLed(true);
     solenoidState = true;
+    setModbusEventCode(MODBUS_EVENT_SOLENOID_ON);
     return;
   }
 
@@ -1727,8 +1773,10 @@ void handleNodeEspNowPacket(const uint8_t* srcMac, const EspNowPacket& pkt) {
     if (solenoidState) {
       actionActive = true;
       actionStartMs = millis();
+      setModbusEventCode(MODBUS_EVENT_SOLENOID_ON);
     } else {
       actionActive = false;
+      setModbusEventCode(MODBUS_EVENT_SOLENOID_OFF);
     }
     return;
   }
@@ -1912,6 +1960,7 @@ void runNodeEspNowLoop() {
   if (inRange && !tagDetected) {
     tagDetected = true;
     confirmOpenSentInCurrentRange = false;
+    setModbusEventCode(MODBUS_EVENT_TAG_ENTER);
     Serial.println("TAG MASUK RANGE!");
   }
 
@@ -1937,6 +1986,7 @@ void runNodeEspNowLoop() {
       tagID = validatedTag;
       setStatusLed(true);
       lastCardRfidTag = tagID;
+      setModbusEventCode(MODBUS_EVENT_RFID_VALID);
       if (inRange && !confirmOpenSentInCurrentRange) {
         publishConfirmOpen(lastCardRfidTag, true);
         confirmOpenSentInCurrentRange = true;
@@ -1947,6 +1997,7 @@ void runNodeEspNowLoop() {
   if (!inRange && tagDetected) {
     tagDetected = false;
     confirmOpenSentInCurrentRange = false;
+    setModbusEventCode(MODBUS_EVENT_TAG_LEAVE);
     setStatusLed(false);
     if (lastCardRfidTag.length() > 0) {
       publishConfirmOpen(lastCardRfidTag, false);
@@ -1961,6 +2012,7 @@ void runNodeEspNowLoop() {
     setActionLed(false);
     setMirrorLed(false);
     solenoidState = false;
+    setModbusEventCode(MODBUS_EVENT_SOLENOID_OFF);
   }
 
   if (buttonWaitActive && !actionActive && (millis() - buttonWaitStartMs >= buttonWaitTimeoutMs)) {
@@ -1973,6 +2025,7 @@ void runNodeEspNowLoop() {
   }
 
   if (buttonWaitActive && !actionActive && buttonPressed && !lastButtonState) {
+    setModbusEventCode(MODBUS_EVENT_BUTTON_PRESS);
     buttonWaitActive = false;
     buttonWaitStartMs = 0;
     actionActive = true;
@@ -1980,6 +2033,7 @@ void runNodeEspNowLoop() {
     setActionLed(true);
     setMirrorLed(true);
     solenoidState = true;
+    setModbusEventCode(MODBUS_EVENT_SOLENOID_ON);
     String confirmTag = lastCardRfidTag.length() > 0 ? lastCardRfidTag : currentBikeId;
     if (confirmTag.length() > 0) publishConfirmOpen(confirmTag, false);
     currentBikeId = "";
@@ -2047,6 +2101,7 @@ void setup() {
   }
 
   bool modbusReady = ModbusHandler::begin(MODBUS_SLAVE_ID_DEFAULT, (uint16_t)slotNumberConfig);
+  modbusLastEventCode = MODBUS_EVENT_BOOT;
   Serial.println(modbusReady ? "Modbus RTU siap (Commit A bootstrap)" : "Modbus RTU gagal init");
 
   Serial.println("\n=== ESP32 + ID-12LA RFID Reader Siap ===");
@@ -2054,19 +2109,20 @@ void setup() {
 }
 
 void loop() {
-  ModbusHandler::updateBasicStatus((uint16_t)slotNumberConfig, millis());
-  ModbusHandler::task();
   server.handleClient();
 
   if (apModeActive) {
+    publishModbusSnapshot();
     delay(10);
     return;
   }
 
   if (isGatewayRole()) {
     runGatewayBridgeLoop();
+    publishModbusSnapshot();
     return;
   }
 
   runNodeEspNowLoop();
+  publishModbusSnapshot();
 }
