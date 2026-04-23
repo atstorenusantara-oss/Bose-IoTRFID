@@ -4,6 +4,12 @@
 
 namespace ModbusMap {
 
+constexpr uint16_t COIL_CMD_SOLENOID = 0;
+constexpr uint16_t COIL_CMD_RESET_FAULT = 1;
+constexpr uint16_t COIL_CMD_SAVE_CONFIG = 2;
+constexpr uint16_t COIL_CMD_REBOOT = 3;
+constexpr uint16_t COIL_CMD_CLEAR_RFID_BUFFER = 4;
+
 constexpr uint16_t ISTS_STS_TAG_IN_RANGE = 0;
 constexpr uint16_t ISTS_STS_BUTTON_PRESSED = 1;
 constexpr uint16_t ISTS_STS_SOLENOID_ACTIVE = 2;

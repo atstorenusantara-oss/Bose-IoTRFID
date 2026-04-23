@@ -167,6 +167,8 @@ unsigned long lastNodeHeartbeatMs = 0;
 unsigned long lastEspNowInitAttemptMs = 0;
 String gatewaySerialRxLine = "";
 uint16_t modbusLastEventCode = MODBUS_EVENT_BOOT;
+bool modbusFaultActive = false;
+uint16_t modbusFaultCode = 0;
 
 void setModbusEventCode(uint16_t code) {
   if (code == 0) return;
@@ -193,15 +195,55 @@ void publishModbusSnapshot() {
     solenoidState,
     actionActive,
     false,
-    false,
+    modbusFaultActive,
     false,
     rfidValid,
     lastCardRfidTag,
     modbusLastEventCode,
-    0,
+    modbusFaultCode,
     actionRemainMs
   );
   ModbusHandler::task();
+}
+
+void processModbusCommands() {
+  ModbusHandler::CommandState cmd = {};
+  if (!ModbusHandler::consumeCommands(&cmd)) return;
+
+  if (cmd.hasSolenoidCommand) {
+    solenoidState = cmd.solenoidValue;
+    setActionLed(solenoidState);
+    setMirrorLed(solenoidState);
+    if (solenoidState) {
+      actionActive = true;
+      actionStartMs = millis();
+      setModbusEventCode(MODBUS_EVENT_SOLENOID_ON);
+    } else {
+      actionActive = false;
+      setModbusEventCode(MODBUS_EVENT_SOLENOID_OFF);
+    }
+  }
+
+  if (cmd.resetFaultPulse) {
+    modbusFaultActive = false;
+    modbusFaultCode = 0;
+    Serial.println("Modbus CMD: reset fault");
+  }
+
+  if (cmd.clearRfidPulse) {
+    tagID = "";
+    lastCardRfidTag = "";
+    lastStatusRfidTag = "";
+    currentBikeId = "";
+    if (!tagDetected) setStatusLed(false);
+    Serial.println("Modbus CMD: clear RFID buffer");
+  }
+
+  if (cmd.rebootPulse) {
+    Serial.println("Modbus CMD: reboot");
+    delay(100);
+    ESP.restart();
+  }
 }
 
 String toLowerTrim(String input) {
@@ -2109,20 +2151,19 @@ void setup() {
 }
 
 void loop() {
+  publishModbusSnapshot();
+  processModbusCommands();
   server.handleClient();
 
   if (apModeActive) {
-    publishModbusSnapshot();
     delay(10);
     return;
   }
 
   if (isGatewayRole()) {
     runGatewayBridgeLoop();
-    publishModbusSnapshot();
     return;
   }
 
   runNodeEspNowLoop();
-  publishModbusSnapshot();
 }

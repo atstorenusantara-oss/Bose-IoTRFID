@@ -8,11 +8,28 @@
 namespace {
 ModbusRTU gModbus;
 bool gReady = false;
+ModbusHandler::CommandState gPendingCommands = {};
+bool gLastSolenoidCoil = false;
+bool gLastResetFaultCoil = false;
+bool gLastRebootCoil = false;
+bool gLastClearRfidCoil = false;
 
 constexpr int8_t RS485_RX_PIN = 25;
 constexpr int8_t RS485_TX_PIN = 26;
 constexpr int8_t RS485_DERE_PIN = 21;
 constexpr uint32_t MODBUS_BAUD_DEFAULT = 9600;
+
+void handlePulseCoil(uint16_t offset, bool& lastState, bool* pulseFlag) {
+  bool current = gModbus.Coil(offset);
+  if (current && !lastState && pulseFlag) {
+    *pulseFlag = true;
+  }
+  if (current) {
+    gModbus.Coil(offset, false);
+    current = false;
+  }
+  lastState = current;
+}
 }
 
 namespace ModbusHandler {
@@ -26,6 +43,11 @@ bool begin(uint8_t slaveId, uint16_t initialSlotNumber) {
   }
 
   gModbus.slave(slaveId);
+  gModbus.addCoil(ModbusMap::COIL_CMD_SOLENOID, false);
+  gModbus.addCoil(ModbusMap::COIL_CMD_RESET_FAULT, false);
+  gModbus.addCoil(ModbusMap::COIL_CMD_SAVE_CONFIG, false);
+  gModbus.addCoil(ModbusMap::COIL_CMD_REBOOT, false);
+  gModbus.addCoil(ModbusMap::COIL_CMD_CLEAR_RFID_BUFFER, false);
   gModbus.addIsts(ModbusMap::ISTS_STS_TAG_IN_RANGE, false);
   gModbus.addIsts(ModbusMap::ISTS_STS_BUTTON_PRESSED, false);
   gModbus.addIsts(ModbusMap::ISTS_STS_SOLENOID_ACTIVE, false);
@@ -48,6 +70,11 @@ bool begin(uint8_t slaveId, uint16_t initialSlotNumber) {
 
   updateBasicStatus(initialSlotNumber, 0);
   updateRuntimeStatus(false, false, false, false, false, false, false, false, "", 1, 0, 0);
+  gPendingCommands = {};
+  gLastSolenoidCoil = false;
+  gLastResetFaultCoil = false;
+  gLastRebootCoil = false;
+  gLastClearRfidCoil = false;
   gReady = true;
   return true;
 }
@@ -106,6 +133,25 @@ void updateRuntimeStatus(
 void task() {
   if (!gReady) return;
   gModbus.task();
+
+  bool solenoidCoil = gModbus.Coil(ModbusMap::COIL_CMD_SOLENOID);
+  if (solenoidCoil != gLastSolenoidCoil) {
+    gPendingCommands.hasSolenoidCommand = true;
+    gPendingCommands.solenoidValue = solenoidCoil;
+    gLastSolenoidCoil = solenoidCoil;
+  }
+
+  handlePulseCoil(ModbusMap::COIL_CMD_RESET_FAULT, gLastResetFaultCoil, &gPendingCommands.resetFaultPulse);
+  handlePulseCoil(ModbusMap::COIL_CMD_REBOOT, gLastRebootCoil, &gPendingCommands.rebootPulse);
+  handlePulseCoil(ModbusMap::COIL_CMD_CLEAR_RFID_BUFFER, gLastClearRfidCoil, &gPendingCommands.clearRfidPulse);
+}
+
+bool consumeCommands(CommandState* out) {
+  if (!out || !gReady) return false;
+  *out = gPendingCommands;
+  bool hasAny = out->hasSolenoidCommand || out->resetFaultPulse || out->rebootPulse || out->clearRfidPulse;
+  gPendingCommands = {};
+  return hasAny;
 }
 
 bool isReady() {
