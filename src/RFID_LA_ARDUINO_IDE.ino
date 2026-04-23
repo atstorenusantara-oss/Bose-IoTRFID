@@ -8,6 +8,7 @@
 #include <Update.h>
 #include <Preferences.h>
 #include <esp_now.h>
+#include "modbus_handler.h"
 
 #define RX_PIN      16     // GPIO16 -> RFID Pin 9 (D0)
 #define RANGE_PIN   17     // GPIO17 -> RFID Pin 6 (Tag in Range)
@@ -29,6 +30,7 @@ const char* GATEWAY_UPLINK_DEFAULT = "mqtt"; // mqtt | serial | both
 
 const char* MQTT_CONFIRM_TOPIC = "boseh/stasiun/confirm_open";
 const char* MQTT_MAINT_TOPIC = "boseh/maintenance";
+const uint8_t MODBUS_SLAVE_ID_DEFAULT = 1;
 
 String wifiSsidConfig = WIFI_SSID_DEFAULT;
 String wifiPasswordConfig = WIFI_PASSWORD_DEFAULT;
@@ -2044,11 +2046,16 @@ void setup() {
     runNodeEspNowSetup();
   }
 
+  bool modbusReady = ModbusHandler::begin(MODBUS_SLAVE_ID_DEFAULT, (uint16_t)slotNumberConfig);
+  Serial.println(modbusReady ? "Modbus RTU siap (Commit A bootstrap)" : "Modbus RTU gagal init");
+
   Serial.println("\n=== ESP32 + ID-12LA RFID Reader Siap ===");
   Serial.println("Dashboard: buka IP ESP32 di browser");
 }
 
 void loop() {
+  ModbusHandler::updateBasicStatus((uint16_t)slotNumberConfig, millis());
+  ModbusHandler::task();
   server.handleClient();
 
   if (apModeActive) {
