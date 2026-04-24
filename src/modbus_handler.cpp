@@ -173,8 +173,15 @@ void processConfigWrites() {
     return;
   }
 
+  if (candidate.applySerialNow == 1) {
+    // Apply-serial request currently uses reboot policy for deterministic re-init.
+    gPendingCommands.rebootPulse = true;
+    candidate.applySerialNow = 0;
+  }
+
   gConfig = candidate;
   gConfigDirty = true;
+  writeConfigToHregs(gConfig);
 }
 
 void handlePulseCoil(uint16_t offset, bool& lastState, bool* pulseFlag) {

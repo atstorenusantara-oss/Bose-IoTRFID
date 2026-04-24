@@ -69,6 +69,18 @@ uint16_t modbusLastEventCode = MODBUS_EVENT_BOOT;
 bool modbusFaultActive = false;
 uint16_t modbusFaultCode = 0;
 
+void setModbusFault(uint16_t code, const char* message) {
+  modbusFaultActive = true;
+  modbusFaultCode = code;
+  if (message) Serial.println(message);
+}
+
+void clearModbusFault(const char* message) {
+  modbusFaultActive = false;
+  modbusFaultCode = 0;
+  if (message) Serial.println(message);
+}
+
 void setModbusEventCode(uint16_t code) {
   if (code == 0) return;
   modbusLastEventCode = code;
@@ -214,6 +226,20 @@ void saveModbusPrefsOnly(
   prefs.end();
 }
 
+void persistAllConfigToPreferences() {
+  saveRuntimeConfig(slotNumberConfig, actionDurationMs, buttonWaitTimeoutMs, relayPin4ActiveHigh, relayPin2ActiveHigh, relayPin22ActiveHigh);
+  saveModbusPrefsOnly(
+    modbusSlaveIdConfig,
+    modbusBaudEnumConfig,
+    modbusParityConfig,
+    modbusStopBitsConfig,
+    modbusUnlockTimeoutSecConfig,
+    localButtonEnableConfig,
+    localButtonPriorityConfig
+  );
+  ModbusHandler::markConfigSaved();
+}
+
 void publishModbusSnapshot() {
   ModbusHandler::ConfigState cfg = {};
   ModbusHandler::getConfigState(&cfg);
@@ -264,15 +290,11 @@ void processModbusCommands() {
   if (!ModbusHandler::consumeCommands(&cmd)) return;
 
   if (cmd.configWriteLockedFault) {
-    modbusFaultActive = true;
-    modbusFaultCode = MODBUS_FAULT_CFG_LOCKED;
-    Serial.println("Modbus config write ditolak: unlock belum valid");
+    setModbusFault(MODBUS_FAULT_CFG_LOCKED, "Modbus config write ditolak: unlock belum valid");
   }
 
   if (cmd.configInvalidRangeFault) {
-    modbusFaultActive = true;
-    modbusFaultCode = MODBUS_FAULT_CFG_INVALID_RANGE;
-    Serial.println("Modbus config write ditolak: nilai di luar range");
+    setModbusFault(MODBUS_FAULT_CFG_INVALID_RANGE, "Modbus config write ditolak: nilai di luar range");
   }
 
   ModbusHandler::ConfigState cfg = {};
@@ -306,23 +328,11 @@ void processModbusCommands() {
   }
 
   if (cmd.resetFaultPulse) {
-    modbusFaultActive = false;
-    modbusFaultCode = 0;
-    Serial.println("Modbus CMD: reset fault");
+    clearModbusFault("Modbus CMD: reset fault");
   }
 
   if (cmd.saveConfigPulse) {
-    saveRuntimeConfig(slotNumberConfig, actionDurationMs, buttonWaitTimeoutMs, relayPin4ActiveHigh, relayPin2ActiveHigh, relayPin22ActiveHigh);
-    saveModbusPrefsOnly(
-      modbusSlaveIdConfig,
-      modbusBaudEnumConfig,
-      modbusParityConfig,
-      modbusStopBitsConfig,
-      modbusUnlockTimeoutSecConfig,
-      localButtonEnableConfig,
-      localButtonPriorityConfig
-    );
-    ModbusHandler::markConfigSaved();
+    persistAllConfigToPreferences();
     Serial.println("Modbus CMD: save config ke Preferences");
   }
 
@@ -336,6 +346,10 @@ void processModbusCommands() {
   }
 
   if (cmd.rebootPulse) {
+    if (ModbusHandler::isConfigDirty()) {
+      persistAllConfigToPreferences();
+      Serial.println("Modbus reboot: config dirty disimpan otomatis");
+    }
     Serial.println("Modbus CMD: reboot");
     delay(100);
     ESP.restart();
